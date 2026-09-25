@@ -2,6 +2,8 @@ package defs
 
 import (
 	"math/rand"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/osbuild/blueprint/pkg/blueprint"
@@ -853,6 +855,103 @@ func TestManifestSubscriptionCustomization(t *testing.T) {
 
 			assert.Contains(t, string(manifestJson), "osbuild-subscription-register.service")
 			assert.Contains(t, string(manifestJson), "/etc/osbuild-subscription-register.env")
+		})
+	}
+}
+
+func TestManifestUnifiedKernelCustomizationsWarn(t *testing.T) {
+	const warnPrefix = `blueprint validation failed for image type "qcow2": the bootc container has a unified kernel (UKI), which does not support: `
+	rootPart := blueprint.PartitionCustomization{
+		Type:                         "plain",
+		FilesystemTypedCustomization: blueprint.FilesystemTypedCustomization{Mountpoint: "/", FSType: "ext4"},
+	}
+	dataPart := blueprint.PartitionCustomization{
+		Type:                         "plain",
+		MinSize:                      datasizes.GiB,
+		FilesystemTypedCustomization: blueprint.FilesystemTypedCustomization{Mountpoint: "/var/data", FSType: "ext4"},
+	}
+
+	for name, tc := range map[string]struct {
+		customizations *blueprint.Customizations
+		options        distro.ImageOptions
+		expected       string
+	}{
+		"empty": {},
+		"disk-root-only": {
+			customizations: &blueprint.Customizations{
+				Disk: &blueprint.DiskCustomization{Partitions: []blueprint.PartitionCustomization{rootPart}},
+			},
+		},
+		"user-and-kargs": {
+			customizations: &blueprint.Customizations{
+				User:   []blueprint.UserCustomization{{Name: "alice"}},
+				Kernel: &blueprint.KernelCustomization{Append: "debug"},
+			},
+			expected: "customizations.user, customizations.kernel.append",
+		},
+		"group": {
+			customizations: &blueprint.Customizations{Group: []blueprint.GroupCustomization{{Name: "wheel2"}}},
+			expected:       "customizations.group",
+		},
+		"files-and-dirs": {
+			customizations: &blueprint.Customizations{
+				Directories: []blueprint.DirectoryCustomization{{Path: "/etc/foo"}},
+				Files:       []blueprint.FileCustomization{{Path: "/etc/foo/bar", Data: "baz"}},
+			},
+			expected: "customizations.directories, customizations.files",
+		},
+		"ignition": {
+			customizations: &blueprint.Customizations{
+				Ignition: &blueprint.IgnitionCustomization{FirstBoot: &blueprint.FirstBootIgnitionCustomization{ProvisioningURL: "https://example.com/config.ign"}},
+			},
+			expected: "customizations.ignition",
+		},
+		"bootloader": {
+			customizations: getBootloaderConfig().Customizations,
+			expected:       "customizations.bootloader",
+		},
+		"subscription": {
+			options: distro.ImageOptions{
+				Subscription: &subscription.ImageOptions{Organization: "2040324", ActivationKey: "my-secret-key"},
+			},
+			expected: "subscription",
+		},
+		"disk-extra-mountpoint": {
+			customizations: &blueprint.Customizations{
+				Disk: &blueprint.DiskCustomization{Partitions: []blueprint.PartitionCustomization{rootPart, dataPart}},
+			},
+			expected: "customizations.disk mountpoints without an fstab (/var/data)",
+		},
+		"filesystem-extra-mountpoint": {
+			customizations: &blueprint.Customizations{
+				Filesystem: []blueprint.FilesystemCustomization{{Mountpoint: "/", MinSize: datasizes.GiB}, {Mountpoint: "/var/data", MinSize: datasizes.GiB}},
+			},
+			expected: "customizations.filesystem mountpoints without an fstab (/var/data)",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			imgType := NewTestBootcImageType(t, "qcow2")
+			bp := &blueprint.Blueprint{Customizations: tc.customizations}
+
+			// only look at the UKI warning, e.g. customizations.filesystem
+			// is not a supported option for bootc disks in the first place
+			ukiWarnings := func() []string {
+				_, warnings, err := imgType.Manifest(bp, tc.options, nil, common.ToPtr(int64(0)))
+				require.NoError(t, err)
+				return slices.DeleteFunc(warnings, func(w string) bool {
+					return !strings.HasPrefix(w, warnPrefix)
+				})
+			}
+
+			// without a UKI all of these are applied
+			assert.Empty(t, ukiWarnings())
+
+			imgType.arch.distro.(*BootcDistro).unifiedKernel = true
+			if tc.expected == "" {
+				assert.Empty(t, ukiWarnings())
+			} else {
+				assert.Equal(t, []string{warnPrefix + tc.expected}, ukiWarnings())
+			}
 		})
 	}
 }

@@ -315,6 +315,14 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 	}
 	img.PartitionTable = pt
 
+	var warnings []string
+	if bd.unifiedKernel {
+		warnings, err = t.checkUnifiedKernelCustomizations(customizations, options)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
 	// Check Directory/File Customizations are valid
 	dc := customizations.GetDirectories()
 	fc := customizations.GetFiles()
@@ -368,7 +376,7 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 		return nil, nil, err
 	}
 
-	return &mf, nil, nil
+	return &mf, warnings, nil
 }
 
 func (t *bootcImageType) initAnacondaInstallerBaseFromSourceInfo(img *image.AnacondaInstallerBase, sourceInfo *osinfo.Info, customizations *blueprint.Customizations) error {
@@ -834,6 +842,105 @@ func (t *bootcImageType) manifestForPXETar(bp *blueprint.Blueprint, options dist
 
 	return &mf, nil, nil
 
+}
+
+// unifiedKernelMountpoints are the mountpoints that work without an fstab on
+// images with a unified kernel: systemd-gpt-auto-generator discovers the root
+// and XBOOTLDR partitions and the ESP from their partition types (the ESP is
+// always at /boot/efi in our partition tables, bootc finds it on its own).
+var unifiedKernelMountpoints = []string{"/", "/boot", "/boot/efi"}
+
+func unsupportedUnifiedKernelMountpoints(mountpoints []string) []string {
+	return slices.DeleteFunc(mountpoints, func(mnt string) bool {
+		return slices.Contains(unifiedKernelMountpoints, mnt)
+	})
+}
+
+// diskCustomizationMountpoints returns all mountpoints of a disk
+// customization, including logical volumes and btrfs subvolumes.
+func diskCustomizationMountpoints(dc *blueprint.DiskCustomization) []string {
+	if dc == nil {
+		return nil
+	}
+	var mountpoints []string
+	for _, part := range dc.Partitions {
+		mountpoints = append(mountpoints, part.Mountpoint)
+		for _, lv := range part.LogicalVolumes {
+			mountpoints = append(mountpoints, lv.Mountpoint)
+		}
+		for _, subvol := range part.Subvolumes {
+			mountpoints = append(mountpoints, subvol.Mountpoint)
+		}
+	}
+	// swap and plain partitions without a filesystem have no mountpoint
+	return slices.DeleteFunc(mountpoints, func(mnt string) bool { return mnt == "" })
+}
+
+// checkUnifiedKernelCustomizations returns a warning for the customizations
+// that a disk image with a unified kernel (UKI) cannot apply. Its kernel
+// command line is embedded in the signed UKI and nothing is written into the
+// deployment after "bootc install", so these would otherwise be dropped
+// silently. Like other blueprint validation failures this is a warning, which
+// image-builder turns into an error unless --ignore-warnings is given.
+// TODO: support /etc and /var customizations, see
+// https://github.com/osbuild/image-builder/issues/2560
+func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *blueprint.Customizations, options distro.ImageOptions) ([]string, error) {
+	var unsupported []string
+	if len(customizations.GetUsers()) > 0 {
+		unsupported = append(unsupported, "customizations.user")
+	}
+	groups, err := customizations.GetGroups()
+	if err != nil {
+		return nil, err
+	}
+	if len(groups) > 0 {
+		unsupported = append(unsupported, "customizations.group")
+	}
+	if len(customizations.GetDirectories()) > 0 {
+		unsupported = append(unsupported, "customizations.directories")
+	}
+	if len(customizations.GetFiles()) > 0 {
+		unsupported = append(unsupported, "customizations.files")
+	}
+	if kernel := customizations.GetKernel(); kernel != nil && kernel.Append != "" {
+		unsupported = append(unsupported, "customizations.kernel.append")
+	}
+	ign, err := customizations.GetIgnition()
+	if err != nil {
+		return nil, err
+	}
+	if ign != nil {
+		unsupported = append(unsupported, "customizations.ignition")
+	}
+	if customizations.GetBootloader() != nil {
+		unsupported = append(unsupported, "customizations.bootloader")
+	}
+	if options.Subscription != nil {
+		unsupported = append(unsupported, "subscription")
+	}
+
+	// Filesystem and disk customizations are fine as long as their
+	// mountpoints are found without an fstab. The container's own disk.yaml
+	// is up to its author and not checked here.
+	var fsMountpoints []string
+	for _, fs := range customizations.GetFilesystems() {
+		fsMountpoints = append(fsMountpoints, fs.Mountpoint)
+	}
+	if mnts := unsupportedUnifiedKernelMountpoints(fsMountpoints); len(mnts) > 0 {
+		unsupported = append(unsupported, fmt.Sprintf("customizations.filesystem mountpoints without an fstab (%s)", strings.Join(mnts, ", ")))
+	}
+	diskCust, err := customizations.GetPartitioning()
+	if err != nil {
+		return nil, err
+	}
+	if mnts := unsupportedUnifiedKernelMountpoints(diskCustomizationMountpoints(diskCust)); len(mnts) > 0 {
+		unsupported = append(unsupported, fmt.Sprintf("customizations.disk mountpoints without an fstab (%s)", strings.Join(mnts, ", ")))
+	}
+
+	if len(unsupported) == 0 {
+		return nil, nil
+	}
+	return []string{fmt.Sprintf("blueprint validation failed for image type %q: the bootc container has a unified kernel (UKI), which does not support: %s", t.Name(), strings.Join(unsupported, ", "))}, nil
 }
 
 func PlatformFor(archStr, uefiVendor string) *platform.Data {

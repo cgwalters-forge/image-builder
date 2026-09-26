@@ -261,6 +261,7 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 
 	img.Bootloader = bd.bootloader
 	img.UnifiedKernel = bd.unifiedKernel
+	img.Composefs = bd.composefs
 
 	img.OSCustomizations.Subscription = options.Subscription
 	img.OSCustomizations.Users = users.UsersFromBP(customizations.GetUsers())
@@ -316,8 +317,8 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 	img.PartitionTable = pt
 
 	var warnings []string
-	if bd.unifiedKernel {
-		warnings, err = t.checkUnifiedKernelCustomizations(customizations, options)
+	if bd.unifiedKernel || bd.composefs {
+		warnings, err = t.checkComposefsCustomizations(customizations, options, bd.unifiedKernel)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -723,6 +724,10 @@ func (t *bootcImageType) manifestForPXETar(bp *blueprint.Blueprint, options dist
 	if bd.imgref == "" {
 		return nil, nil, fmt.Errorf("internal error: no base image defined")
 	}
+	// The live root is made from an ostree deployment
+	if bd.composefs {
+		return nil, nil, fmt.Errorf("image type %q is not supported for bootc containers that select the composefs backend", t.Name())
+	}
 
 	// The bootc PXE initramfs requires the dmsquash-live and ostree modules in order to boot
 	// check for them here so that we can tell the user instead of failing to boot
@@ -839,15 +844,17 @@ func (t *bootcImageType) manifestForPXETar(bp *blueprint.Blueprint, options dist
 
 }
 
-// unifiedKernelMountpoints are the mountpoints that work without an fstab on
-// images with a unified kernel: systemd-gpt-auto-generator discovers the root
-// and XBOOTLDR partitions and the ESP from their partition types (the ESP is
-// always at /boot/efi in our partition tables, bootc finds it on its own).
-var unifiedKernelMountpoints = []string{"/", "/boot", "/boot/efi"}
+// composefsMountpoints are the mountpoints that work without an fstab on
+// images with the composefs backend. With a unified kernel,
+// systemd-gpt-auto-generator discovers the root and XBOOTLDR partitions from
+// their partition types; otherwise bootc puts the root and a separate /boot
+// on the kernel command line. The ESP is always at /boot/efi in our partition
+// tables, bootc finds it on its own.
+var composefsMountpoints = []string{"/", "/boot", "/boot/efi"}
 
-func unsupportedUnifiedKernelMountpoints(mountpoints []string) []string {
+func unsupportedComposefsMountpoints(mountpoints []string) []string {
 	return slices.DeleteFunc(mountpoints, func(mnt string) bool {
-		return slices.Contains(unifiedKernelMountpoints, mnt)
+		return slices.Contains(composefsMountpoints, mnt)
 	})
 }
 
@@ -871,15 +878,16 @@ func diskCustomizationMountpoints(dc *blueprint.DiskCustomization) []string {
 	return slices.DeleteFunc(mountpoints, func(mnt string) bool { return mnt == "" })
 }
 
-// checkUnifiedKernelCustomizations returns a warning for the customizations
-// that a disk image with a unified kernel (UKI) cannot apply. Its kernel
-// command line is embedded in the signed UKI and nothing is written into the
-// deployment after "bootc install", so these would otherwise be dropped
-// silently. Like other blueprint validation failures this is a warning, which
-// image-builder turns into an error unless --ignore-warnings is given.
+// checkComposefsCustomizations returns a warning for the customizations that
+// a disk image with the composefs backend cannot apply. Nothing is written
+// into the deployment after "bootc install", and with a unified kernel (UKI)
+// the kernel command line is embedded in the signed UKI, so these would
+// otherwise be dropped silently. Like other blueprint validation failures
+// this is a warning, which image-builder turns into an error unless
+// --ignore-warnings is given.
 // TODO: support /etc and /var customizations, see
 // https://github.com/osbuild/image-builder/issues/2560
-func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *blueprint.Customizations, options distro.ImageOptions) ([]string, error) {
+func (t *bootcImageType) checkComposefsCustomizations(customizations *blueprint.Customizations, options distro.ImageOptions, unifiedKernel bool) ([]string, error) {
 	var unsupported []string
 	if len(customizations.GetUsers()) > 0 {
 		unsupported = append(unsupported, "customizations.user")
@@ -897,7 +905,8 @@ func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *bluepr
 	if len(customizations.GetFiles()) > 0 {
 		unsupported = append(unsupported, "customizations.files")
 	}
-	if kernel := customizations.GetKernel(); kernel != nil && kernel.Append != "" {
+	// without a UKI, bootc install sets the kernel arguments
+	if kernel := customizations.GetKernel(); unifiedKernel && kernel != nil && kernel.Append != "" {
 		unsupported = append(unsupported, "customizations.kernel.append")
 	}
 	ign, err := customizations.GetIgnition()
@@ -921,21 +930,25 @@ func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *bluepr
 	for _, fs := range customizations.GetFilesystems() {
 		fsMountpoints = append(fsMountpoints, fs.Mountpoint)
 	}
-	if mnts := unsupportedUnifiedKernelMountpoints(fsMountpoints); len(mnts) > 0 {
+	if mnts := unsupportedComposefsMountpoints(fsMountpoints); len(mnts) > 0 {
 		unsupported = append(unsupported, fmt.Sprintf("customizations.filesystem mountpoints without an fstab (%s)", strings.Join(mnts, ", ")))
 	}
 	diskCust, err := customizations.GetPartitioning()
 	if err != nil {
 		return nil, err
 	}
-	if mnts := unsupportedUnifiedKernelMountpoints(diskCustomizationMountpoints(diskCust)); len(mnts) > 0 {
+	if mnts := unsupportedComposefsMountpoints(diskCustomizationMountpoints(diskCust)); len(mnts) > 0 {
 		unsupported = append(unsupported, fmt.Sprintf("customizations.disk mountpoints without an fstab (%s)", strings.Join(mnts, ", ")))
 	}
 
 	if len(unsupported) == 0 {
 		return nil, nil
 	}
-	return []string{fmt.Sprintf("blueprint validation failed for image type %q: the bootc container has a unified kernel (UKI), which does not support: %s", t.Name(), strings.Join(unsupported, ", "))}, nil
+	reason := "selects the composefs backend"
+	if unifiedKernel {
+		reason = "has a unified kernel (UKI)"
+	}
+	return []string{fmt.Sprintf("blueprint validation failed for image type %q: the bootc container %s, which does not support: %s", t.Name(), reason, strings.Join(unsupported, ", "))}, nil
 }
 
 func PlatformFor(archStr, uefiVendor string) *platform.Data {

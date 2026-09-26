@@ -726,8 +726,19 @@ func TestManifestSubscriptionCustomization(t *testing.T) {
 	}
 }
 
-func TestManifestUnifiedKernelCustomizationsWarn(t *testing.T) {
-	const warnPrefix = `blueprint validation failed for image type "qcow2": the bootc container has a unified kernel (UKI), which does not support: `
+func TestManifestPXEComposefsUnsupported(t *testing.T) {
+	imgType := NewTestBootcImageType(t, "pxe-tar-xz")
+	_, _, err := imgType.Manifest(&blueprint.Blueprint{}, distro.ImageOptions{}, nil, common.ToPtr(int64(0)))
+	require.NoError(t, err)
+
+	imgType.arch.distro.(*BootcDistro).composefs = true
+	_, _, err = imgType.Manifest(&blueprint.Blueprint{}, distro.ImageOptions{}, nil, common.ToPtr(int64(0)))
+	assert.EqualError(t, err, `image type "pxe-tar-xz" is not supported for bootc containers that select the composefs backend`)
+}
+
+func TestManifestComposefsCustomizationsWarn(t *testing.T) {
+	const ukiWarnPrefix = `blueprint validation failed for image type "qcow2": the bootc container has a unified kernel (UKI), which does not support: `
+	const composefsWarnPrefix = `blueprint validation failed for image type "qcow2": the bootc container selects the composefs backend, which does not support: `
 	rootPart := blueprint.PartitionCustomization{
 		Type:                         "plain",
 		FilesystemTypedCustomization: blueprint.FilesystemTypedCustomization{Mountpoint: "/", FSType: "ext4"},
@@ -742,6 +753,8 @@ func TestManifestUnifiedKernelCustomizationsWarn(t *testing.T) {
 		customizations *blueprint.Customizations
 		options        distro.ImageOptions
 		expected       string
+		// only a unified kernel does not support it
+		ukiOnly bool
 	}{
 		"empty": {},
 		"disk-root-only": {
@@ -749,12 +762,14 @@ func TestManifestUnifiedKernelCustomizationsWarn(t *testing.T) {
 				Disk: &blueprint.DiskCustomization{Partitions: []blueprint.PartitionCustomization{rootPart}},
 			},
 		},
-		"user-and-kargs": {
-			customizations: &blueprint.Customizations{
-				User:   []blueprint.UserCustomization{{Name: "alice"}},
-				Kernel: &blueprint.KernelCustomization{Append: "debug"},
-			},
-			expected: "customizations.user, customizations.kernel.append",
+		"user": {
+			customizations: &blueprint.Customizations{User: []blueprint.UserCustomization{{Name: "alice"}}},
+			expected:       "customizations.user",
+		},
+		"kargs": {
+			customizations: &blueprint.Customizations{Kernel: &blueprint.KernelCustomization{Append: "debug"}},
+			expected:       "customizations.kernel.append",
+			ukiOnly:        true,
 		},
 		"group": {
 			customizations: &blueprint.Customizations{Group: []blueprint.GroupCustomization{{Name: "wheel2"}}},
@@ -800,24 +815,39 @@ func TestManifestUnifiedKernelCustomizationsWarn(t *testing.T) {
 			imgType := NewTestBootcImageType(t, "qcow2")
 			bp := &blueprint.Blueprint{Customizations: tc.customizations}
 
-			// only look at the UKI warning, e.g. customizations.filesystem
-			// is not a supported option for bootc disks in the first place
-			ukiWarnings := func() []string {
+			bd := imgType.arch.distro.(*BootcDistro)
+
+			// only look at the composefs warnings, e.g.
+			// customizations.filesystem is not a supported option for
+			// bootc disks in the first place
+			composefsWarnings := func() []string {
 				_, warnings, err := imgType.Manifest(bp, tc.options, nil, common.ToPtr(int64(0)))
 				require.NoError(t, err)
 				return slices.DeleteFunc(warnings, func(w string) bool {
-					return !strings.HasPrefix(w, warnPrefix)
+					return !strings.HasPrefix(w, ukiWarnPrefix) && !strings.HasPrefix(w, composefsWarnPrefix)
 				})
 			}
 
-			// without a UKI all of these are applied
-			assert.Empty(t, ukiWarnings())
+			// with ostree all of these are applied
+			assert.Empty(t, composefsWarnings())
 
-			imgType.arch.distro.(*BootcDistro).unifiedKernel = true
-			if tc.expected == "" {
-				assert.Empty(t, ukiWarnings())
+			bd.composefs = true
+			if tc.expected == "" || tc.ukiOnly {
+				assert.Empty(t, composefsWarnings())
 			} else {
-				assert.Equal(t, []string{warnPrefix + tc.expected}, ukiWarnings())
+				assert.Equal(t, []string{composefsWarnPrefix + tc.expected}, composefsWarnings())
+			}
+
+			// a unified kernel implies composefs, with or without the
+			// install configuration
+			for _, composefs := range []bool{true, false} {
+				bd.composefs = composefs
+				bd.unifiedKernel = true
+				if tc.expected == "" {
+					assert.Empty(t, composefsWarnings())
+				} else {
+					assert.Equal(t, []string{ukiWarnPrefix + tc.expected}, composefsWarnings())
+				}
 			}
 		})
 	}

@@ -282,3 +282,22 @@ echo '%s'
 		assert.Equal(t, tc.Out, installConfig.Bootloader)
 	}
 }
+
+func TestComposefsBackend(t *testing.T) {
+	for _, tc := range []struct {
+		In  string
+		Out bool
+	}{
+		{`{}`, false},
+		{`{"composefs-backend": false}`, false},
+		{`{"composefs-backend": true}`, true},
+	} {
+		makeFakePodman(t, fmt.Sprintf(`#!/bin/sh
+echo '%s'
+`, tc.In))
+		cnt := bootc.Container{}
+		installConfig, err := cnt.InstallConfiguration()
+		assert.NoError(t, err)
+		assert.Equal(t, tc.Out, installConfig.ComposefsBackend, tc.In)
+	}
+}

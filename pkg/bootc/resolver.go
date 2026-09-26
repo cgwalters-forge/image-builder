@@ -234,6 +234,7 @@ func (c *Container) ResolveInfo(variant string) (*Info, error) {
 	}
 	bootcInfo.DefaultRootFs = bootcInstallConfig.Filesystem.Root.Type
 	bootcInfo.Bootloader = bootcInstallConfig.Bootloader
+	bootcInfo.ComposefsBackend = bootcInstallConfig.ComposefsBackend
 
 	unifiedKernel, err := c.UnifiedKernel()
 	if err != nil {
@@ -320,6 +321,10 @@ type BootcInstallConfiguration struct {
 	} `json:"filesystem"`
 
 	Bootloader *string `json:"bootloader"`
+
+	// Set by bootc versions that support selecting the composefs backend
+	// in the install configuration
+	ComposefsBackend bool `json:"composefs-backend"`
 }
 
 // InstallConfiguration returns the install configuration for bootc container

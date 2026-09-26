@@ -955,3 +955,109 @@ func TestManifestUnifiedKernelCustomizationsWarn(t *testing.T) {
 		})
 	}
 }
+
+func TestManifestUnifiedKernelRootLayout(t *testing.T) {
+	const errPrefix = "bootc containers with a unified kernel (UKI) need / directly on a GPT partition with the root partition type: the UKI command line has no root=, so the initrd finds / by its partition type, but "
+	const useDiskCust = ": use a plain partition for / in customizations.disk"
+	plainRoot := blueprint.PartitionCustomization{
+		Type:                         "plain",
+		FilesystemTypedCustomization: blueprint.FilesystemTypedCustomization{Mountpoint: "/", FSType: "ext4"},
+	}
+	plainRootDataType := plainRoot
+	plainRootDataType.PartType = disk.FilesystemDataGUID
+	lvmRoot := blueprint.PartitionCustomization{
+		Type: "lvm",
+		VGCustomization: blueprint.VGCustomization{
+			LogicalVolumes: []blueprint.LVCustomization{
+				{FilesystemTypedCustomization: blueprint.FilesystemTypedCustomization{Mountpoint: "/", FSType: "xfs"}},
+			},
+		},
+	}
+	// without a mountpoint for /, the root LV is added to the volume group
+	lvmNoRoot := blueprint.PartitionCustomization{
+		Type: "lvm",
+		VGCustomization: blueprint.VGCustomization{
+			LogicalVolumes: []blueprint.LVCustomization{
+				{MinSize: datasizes.GiB, FilesystemTypedCustomization: blueprint.FilesystemTypedCustomization{Mountpoint: "/var/data", FSType: "xfs"}},
+			},
+		},
+	}
+	btrfsRoot := blueprint.PartitionCustomization{
+		Type: "btrfs",
+		BtrfsVolumeCustomization: blueprint.BtrfsVolumeCustomization{
+			Subvolumes: []blueprint.BtrfsSubvolumeCustomization{{Name: "root", Mountpoint: "/"}},
+		},
+	}
+	diskCust := func(ptType string, parts ...blueprint.PartitionCustomization) *blueprint.Customizations {
+		return &blueprint.Customizations{Disk: &blueprint.DiskCustomization{Type: ptType, Partitions: parts}}
+	}
+	fsCust := &blueprint.Customizations{Filesystem: []blueprint.FilesystemCustomization{{Mountpoint: "/", MinSize: 10 * datasizes.GiB}}}
+
+	for name, tc := range map[string]struct {
+		customizations *blueprint.Customizations
+		defaultFs      string
+		// the container's own disk customization and partition table
+		containerCustomizations *blueprint.Customizations
+		containerPT             bool
+		expectedErr             string
+	}{
+		"default":               {},
+		"filesystem":            {customizations: fsCust},
+		"disk-plain":            {customizations: diskCust("", plainRoot)},
+		"disk-plain-data-type":  {customizations: diskCust("", plainRootDataType), expectedErr: "the partition of / has the type " + disk.FilesystemDataGUID + " instead of " + disk.RootPartitionX86_64GUID + ": leave part_type unset for / in customizations.disk"},
+		"disk-lvm":              {customizations: diskCust("", lvmRoot), expectedErr: "/ is on an LVM logical volume" + useDiskCust},
+		"disk-lvm-without-root": {customizations: diskCust("", lvmNoRoot), expectedErr: "/ is on an LVM logical volume" + useDiskCust},
+		"disk-btrfs":            {customizations: diskCust("", btrfsRoot), expectedErr: "/ is in a btrfs subvolume" + useDiskCust},
+		"disk-dos":              {customizations: diskCust("dos", plainRoot), expectedErr: `the partition table type is "dos": use a gpt partition table`},
+		"default-btrfs": {
+			defaultFs:   "btrfs",
+			expectedErr: `the container's default root filesystem type "btrfs" puts / in a btrfs subvolume: use --bootc-default-fs (image-builder) or --rootfs (bootc-image-builder) with ext4 or xfs, or a plain partition for / in customizations.disk`,
+		},
+		"default-btrfs-disk-plain": {defaultFs: "btrfs", customizations: diskCust("", plainRoot)},
+		"container-disk-lvm":       {containerCustomizations: diskCust("", lvmRoot)},
+		"container-disk-and-user-disk-lvm": {
+			customizations:          diskCust("", lvmRoot),
+			containerCustomizations: diskCust("", plainRoot),
+			expectedErr:             "/ is on an LVM logical volume" + useDiskCust,
+		},
+		// the container's customization has no layout, so our default table is used
+		"container-customization-without-layout-default-btrfs": {
+			defaultFs:               "btrfs",
+			containerCustomizations: &blueprint.Customizations{Hostname: common.ToPtr("example")},
+			expectedErr:             `the container's default root filesystem type "btrfs" puts / in a btrfs subvolume: use --bootc-default-fs (image-builder) or --rootfs (bootc-image-builder) with ext4 or xfs, or a plain partition for / in customizations.disk`,
+		},
+		// used as-is, without the DPS root type
+		"container-partition-table":                   {containerPT: true},
+		"container-partition-table-and-filesystem":    {containerPT: true, customizations: fsCust},
+		"container-partition-table-and-user-disk-lvm": {containerPT: true, customizations: diskCust("", lvmRoot), expectedErr: "/ is on an LVM logical volume" + useDiskCust},
+	} {
+		t.Run(name, func(t *testing.T) {
+			imgType := NewTestBootcImageType(t, "qcow2")
+			bd := imgType.arch.distro.(*BootcDistro)
+			if tc.defaultFs != "" {
+				bd.defaultFs = tc.defaultFs
+			}
+			bd.sourceInfo.ImageCustomization = tc.containerCustomizations
+			if tc.containerPT {
+				pt, err := imgType.BasePartitionTable()
+				require.NoError(t, err)
+				bd.sourceInfo.PartitionTable = pt
+			}
+			bp := &blueprint.Blueprint{Customizations: tc.customizations}
+			manifest := func() error {
+				_, _, err := imgType.Manifest(bp, distro.ImageOptions{}, nil, common.ToPtr(int64(0)))
+				return err
+			}
+
+			// without a UKI, the kernel command line has root=
+			require.NoError(t, manifest())
+
+			bd.unifiedKernel = true
+			if tc.expectedErr == "" {
+				assert.NoError(t, manifest())
+			} else {
+				assert.EqualError(t, manifest(), errPrefix+tc.expectedErr)
+			}
+		})
+	}
+}

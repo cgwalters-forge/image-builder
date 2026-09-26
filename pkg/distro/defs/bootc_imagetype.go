@@ -321,6 +321,9 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 		if err != nil {
 			return nil, nil, err
 		}
+		if err := t.checkUnifiedKernelRoot(pt, customizations); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// Check Directory/File Customizations are valid
@@ -941,6 +944,87 @@ func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *bluepr
 		return nil, nil
 	}
 	return []string{fmt.Sprintf("blueprint validation failed for image type %q: the bootc container has a unified kernel (UKI), which does not support: %s", t.Name(), strings.Join(unsupported, ", "))}, nil
+}
+
+// checkUnifiedKernelRoot returns an error if the initrd of an image with a
+// unified kernel (UKI) can't find the root filesystem of pt. The UKI command
+// line normally has no root=, so systemd-gpt-auto-generator finds / by the
+// DPS root partition type, which only works for a filesystem directly on a
+// GPT partition of that type, or in a LUKS volume on it: not on LVM, and not
+// in a btrfs subvolume (gpt-auto mounts the default subvolume, and the UKI
+// has no rootflags=). A layout that comes from the container is up to its
+// author and not checked here.
+func (t *bootcImageType) checkUnifiedKernelRoot(pt *disk.PartitionTable, customizations *blueprint.Customizations) error {
+	bd := t.arch.distro.(*BootcDistro)
+	diskCust, err := customizations.GetPartitioning()
+	if err != nil {
+		return err
+	}
+	// the same precedence as in genPartitionTable()
+	if diskCust == nil && bd.sourceInfo != nil {
+		containerCust := bd.sourceInfo.ImageCustomization
+		containerDiskCust, err := containerCust.GetPartitioning()
+		if err != nil {
+			return err
+		}
+		containerHasLayout := containerCust.GetFilesystems() != nil || containerDiskCust != nil
+		if bd.sourceInfo.PartitionTable != nil || (customizations.GetFilesystems() == nil && containerHasLayout) {
+			return nil
+		}
+	}
+
+	const errPrefix = "bootc containers with a unified kernel (UKI) need / directly on a GPT partition with the root partition type: the UKI command line has no root=, so the initrd finds / by its partition type"
+	const useDiskCust = "use a plain partition for / in customizations.disk"
+	if pt.Type != disk.PT_GPT {
+		return fmt.Errorf("%s, but the partition table type is %q: use a gpt partition table", errPrefix, pt.Type)
+	}
+	// the path runs from the partition table via a partition to the root
+	// filesystem, with any volumes in between
+	var path []disk.Entity
+	err = pt.ForEachMountable(func(mnt disk.Mountable, p []disk.Entity) error {
+		if mnt.GetMountpoint() == "/" {
+			path = slices.Clone(p)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(path) < 3 {
+		return fmt.Errorf("%s, but the partition table has no root filesystem", errPrefix)
+	}
+	part, ok := path[1].(*disk.Partition)
+	if !ok {
+		return fmt.Errorf("%s, but / is not on a partition: %s", errPrefix, useDiskCust)
+	}
+	volumes := path[2 : len(path)-1]
+	// directly on the partition, or in a LUKS volume on it, is fine
+	if len(volumes) > 1 || (len(volumes) == 1 && !isLUKSContainer(volumes[0])) {
+		switch volumes[0].(type) {
+		case *disk.LVMVolumeGroup:
+			return fmt.Errorf("%s, but / is on an LVM logical volume: %s", errPrefix, useDiskCust)
+		case *disk.Btrfs:
+			if diskCust == nil {
+				return fmt.Errorf("%s, but the container's default root filesystem type %q puts / in a btrfs subvolume: use --bootc-default-fs (image-builder) or --rootfs (bootc-image-builder) with ext4 or xfs, or a plain partition for / in customizations.disk", errPrefix, bd.defaultFs)
+			}
+			return fmt.Errorf("%s, but / is in a btrfs subvolume: %s", errPrefix, useDiskCust)
+		default:
+			return fmt.Errorf("%s, but / is not directly on a partition: %s", errPrefix, useDiskCust)
+		}
+	}
+	rootType, err := disk.RootPartitionTypeGUID(t.arch.arch)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(part.Type, rootType) {
+		return fmt.Errorf("%s, but the partition of / has the type %s instead of %s: leave part_type unset for / in customizations.disk", errPrefix, part.Type, rootType)
+	}
+	return nil
+}
+
+func isLUKSContainer(ent disk.Entity) bool {
+	_, ok := ent.(*disk.LUKSContainer)
+	return ok
 }
 
 func PlatformFor(archStr, uefiVendor string) *platform.Data {

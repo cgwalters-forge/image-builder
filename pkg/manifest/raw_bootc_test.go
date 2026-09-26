@@ -300,6 +300,56 @@ func TestRawBootcImageSerializeCustomizationGenCorrectStages(t *testing.T) {
 	}
 }
 
+func TestRawBootcImageSerializeComposefs(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		unifiedKernel bool
+		composefs     bool
+
+		expectedComposefs bool
+		expectedKargs     []string
+	}{
+		{"ostree", false, false, false, []string{"karg1"}},
+		{"composefs-bls", false, true, true, []string{"karg1"}},
+		{"uki", true, false, true, nil},
+		{"uki-composefs", true, true, true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rawBootcPipeline := makeFakeRawBootcPipeline()
+			rawBootcPipeline.UnifiedKernel = tc.unifiedKernel
+			rawBootcPipeline.Composefs = tc.composefs
+			rawBootcPipeline.OSCustomizations.KernelOptionsAppend = []string{"karg1"}
+			rawBootcPipeline.OSCustomizations.Users = []users.User{{Name: "foo"}}
+
+			pipeline, err := rawBootcPipeline.Serialize()
+			require.NoError(t, err)
+
+			bootcInst := findStage("org.osbuild.bootc.install-to-filesystem", pipeline.Stages)
+			require.NotNil(t, bootcInst)
+			opts := bootcInst.Options.(*osbuild.BootcInstallToFilesystemOptions)
+			assert.Equal(t, tc.expectedComposefs, common.ValueOrEmpty(opts.ComposeFS))
+			assert.Equal(t, tc.expectedKargs, opts.Kargs)
+
+			// the customization stages need the ostree deployment,
+			// which composefs does not have
+			var deploymentMounts int
+			for _, stage := range pipeline.Stages {
+				if findMountIdx(stage.Mounts, "org.osbuild.ostree.deployment") >= 0 {
+					deploymentMounts++
+				}
+			}
+			usersStages := findPostInstallStages("org.osbuild.users", pipeline.Stages)
+			if tc.expectedComposefs {
+				assert.Zero(t, deploymentMounts)
+				assert.Empty(t, usersStages)
+			} else {
+				assert.NotZero(t, deploymentMounts)
+				assert.Len(t, usersStages, 1)
+			}
+		})
+	}
+}
+
 func RawBootcImageSerializeCommonPipelines(t *testing.T) {
 	expectedCommonStages := []string{
 		"org.osbuild.truncate",

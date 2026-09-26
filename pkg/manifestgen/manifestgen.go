@@ -186,11 +186,13 @@ func (mg *Generator) Generate(bp *blueprint.Blueprint, imgType distro.ImageType,
 		return nil, err
 	}
 	if len(warnings) > 0 {
-		warn := strings.Join(warnings, "\n")
 		if mg.warningsOutput != nil {
-			fmt.Fprint(mg.warningsOutput, warn)
+			for _, warn := range warnings {
+				// e.g. the FIPS warning comes with its own newline
+				fmt.Fprintf(mg.warningsOutput, "WARNING: %s\n", strings.TrimRight(warn, "\n"))
+			}
 		} else {
-			return nil, fmt.Errorf("Warnings during manifest creation:\n%v", warn)
+			return nil, fmt.Errorf("Warnings during manifest creation:\n%v", strings.Join(warnings, "\n"))
 		}
 	}
 	pkgSetChains, err := preManifest.GetPackageSetChains()

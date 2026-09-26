@@ -25,7 +25,10 @@ type BootcDistro struct {
 	sourceInfo      *osinfo.Info
 	buildSourceInfo *osinfo.Info
 	unifiedKernel   bool
-	bootloader      *string
+	// the install configuration selects the composefs backend (a unified
+	// kernel implies it as well)
+	composefs  bool
+	bootloader *string
 
 	id            distro.ID
 	defaultFs     string
@@ -140,6 +143,7 @@ func NewBootcWithLoader(loader *Loader, name string, cinfo *bootc.Info) (*BootcD
 		rootfsMinSize:   cinfo.Size * containerSizeToDiskSizeMultiplier,
 		bootloader:      cinfo.Bootloader,
 		unifiedKernel:   cinfo.UnifiedKernel,
+		composefs:       cinfo.ComposefsBackend,
 	}
 
 	// load image types from bootc-generic-1

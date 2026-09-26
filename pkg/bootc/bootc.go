@@ -30,4 +30,8 @@ type Info struct {
 
 	// What bootloader should be passed?
 	Bootloader *string
+
+	// Does the container's install configuration select the composefs
+	// backend? A unified kernel implies it regardless of this setting.
+	ComposefsBackend bool
 }

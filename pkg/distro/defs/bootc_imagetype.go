@@ -318,7 +318,7 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 
 	var warnings []string
 	if bd.unifiedKernel || bd.composefs {
-		warnings, err = t.checkComposefsCustomizations(customizations, options, bd.unifiedKernel)
+		warnings, err = t.checkComposefsCustomizations(customizations, bd.unifiedKernel)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -879,32 +879,16 @@ func diskCustomizationMountpoints(dc *blueprint.DiskCustomization) []string {
 }
 
 // checkComposefsCustomizations returns a warning for the customizations that
-// a disk image with the composefs backend cannot apply. Nothing is written
-// into the deployment after "bootc install", and with a unified kernel (UKI)
-// the kernel command line is embedded in the signed UKI, so these would
-// otherwise be dropped silently. Like other blueprint validation failures
-// this is a warning, which image-builder turns into an error unless
+// a disk image with the composefs backend cannot apply. Users, groups,
+// directories, files and the subscription are fine: they go into the
+// deployment's /etc and /var, which the org.osbuild.bootc.deployment mount
+// assembles. But there is no fstab for other mountpoints, and with a unified
+// kernel (UKI) the kernel command line is embedded in the signed UKI, so
+// these would otherwise be dropped silently. Like other blueprint validation
+// failures this is a warning, which image-builder turns into an error unless
 // --ignore-warnings is given.
-// TODO: support /etc and /var customizations, see
-// https://github.com/osbuild/image-builder/issues/2560
-func (t *bootcImageType) checkComposefsCustomizations(customizations *blueprint.Customizations, options distro.ImageOptions, unifiedKernel bool) ([]string, error) {
+func (t *bootcImageType) checkComposefsCustomizations(customizations *blueprint.Customizations, unifiedKernel bool) ([]string, error) {
 	var unsupported []string
-	if len(customizations.GetUsers()) > 0 {
-		unsupported = append(unsupported, "customizations.user")
-	}
-	groups, err := customizations.GetGroups()
-	if err != nil {
-		return nil, err
-	}
-	if len(groups) > 0 {
-		unsupported = append(unsupported, "customizations.group")
-	}
-	if len(customizations.GetDirectories()) > 0 {
-		unsupported = append(unsupported, "customizations.directories")
-	}
-	if len(customizations.GetFiles()) > 0 {
-		unsupported = append(unsupported, "customizations.files")
-	}
 	// without a UKI, bootc install sets the kernel arguments
 	if kernel := customizations.GetKernel(); unifiedKernel && kernel != nil && kernel.Append != "" {
 		unsupported = append(unsupported, "customizations.kernel.append")
@@ -918,9 +902,6 @@ func (t *bootcImageType) checkComposefsCustomizations(customizations *blueprint.
 	}
 	if customizations.GetBootloader() != nil {
 		unsupported = append(unsupported, "customizations.bootloader")
-	}
-	if options.Subscription != nil {
-		unsupported = append(unsupported, "subscription")
 	}
 
 	// Filesystem and disk customizations are fine as long as their

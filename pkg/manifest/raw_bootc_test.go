@@ -330,21 +330,61 @@ func TestRawBootcImageSerializeComposefs(t *testing.T) {
 			assert.Equal(t, tc.expectedComposefs, common.ValueOrEmpty(opts.ComposeFS))
 			assert.Equal(t, tc.expectedKargs, opts.Kargs)
 
-			// the customization stages need the ostree deployment,
-			// which composefs does not have
-			var deploymentMounts int
-			for _, stage := range pipeline.Stages {
-				if findMountIdx(stage.Mounts, "org.osbuild.ostree.deployment") >= 0 {
-					deploymentMounts++
-				}
+			// the customizations are applied on either backend, with
+			// bootc mounting the deployment for composefs
+			expectedMount, otherMount := "org.osbuild.ostree.deployment", "org.osbuild.bootc.deployment"
+			if tc.expectedComposefs {
+				expectedMount, otherMount = otherMount, expectedMount
 			}
 			usersStages := findPostInstallStages("org.osbuild.users", pipeline.Stages)
-			if tc.expectedComposefs {
-				assert.Zero(t, deploymentMounts)
-				assert.Empty(t, usersStages)
-			} else {
-				assert.NotZero(t, deploymentMounts)
-				assert.Len(t, usersStages, 1)
+			require.Len(t, usersStages, 1)
+			assert.GreaterOrEqual(t, findMountIdx(usersStages[0].Mounts, expectedMount), 0)
+			for _, stage := range pipeline.Stages {
+				assert.Equal(t, -1, findMountIdx(stage.Mounts, otherMount), stage.Type)
+			}
+		})
+	}
+}
+
+func TestRawBootcImageSerializeComposefsNoCustomizations(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		unifiedKernel bool
+		composefs     bool
+	}{
+		// the ostree case makes sure the stages checked for are generated at all
+		{"ostree", false, false},
+		{"composefs-bls", false, true},
+		{"uki", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rawBootcPipeline := makeFakeRawBootcPipeline()
+			rawBootcPipeline.UnifiedKernel = tc.unifiedKernel
+			rawBootcPipeline.Composefs = tc.composefs
+			rawBootcPipeline.OSCustomizations.SELinux = "targeted"
+			// set by image definitions rather than the user
+			rawBootcPipeline.OSCustomizations.Grub2Config = &osbuild.GRUB2Config{
+				Serial: "serial --unit=0 --speed=115200",
+			}
+			rawBootcPipeline.DiskCustomizations.MountConfiguration = osbuild.MOUNT_CONFIGURATION_FSTAB
+
+			pipeline, err := rawBootcPipeline.Serialize()
+			require.NoError(t, err)
+
+			// With composefs and no customizations, nothing follows the
+			// install stage but finishing the image: no deployment mount,
+			// and no relabel of /etc and /var.
+			composefs := tc.unifiedKernel || tc.composefs
+			for _, stageType := range []string{"org.osbuild.fstab", "org.osbuild.grub2.d", "org.osbuild.selinux"} {
+				stages := findPostInstallStages(stageType, pipeline.Stages)
+				if composefs {
+					assert.Empty(t, stages, stageType)
+				} else {
+					assert.NotEmpty(t, stages, stageType)
+				}
+			}
+			for _, stage := range pipeline.Stages {
+				assert.Equal(t, -1, findMountIdx(stage.Mounts, "org.osbuild.bootc.deployment"), stage.Type)
 			}
 		})
 	}

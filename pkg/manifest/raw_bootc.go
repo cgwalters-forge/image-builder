@@ -199,20 +199,28 @@ func (p *RawBootcImage) serialize() (osbuild.Pipeline, error) {
 		pipeline.AddStage(stage)
 	}
 
-	// There is no ostree deployment to customize with composefs
-	if !composefs {
-		// all our customizations work directly on the mounted deployment
-		// root from the image so generate the devices/mounts for all
-		devices, mounts, err = osbuild.GenBootupdDevicesMounts(p.filename, p.PartitionTable, p.platform)
-		if err != nil {
-			return osbuild.Pipeline{}, fmt.Errorf("gen devices stage failed %w", err)
-		}
+	// all our customizations work directly on the mounted deployment
+	// root from the image so generate the devices/mounts for all
+	devices, mounts, err = osbuild.GenBootupdDevicesMounts(p.filename, p.PartitionTable, p.platform)
+	if err != nil {
+		return osbuild.Pipeline{}, fmt.Errorf("gen devices stage failed %w", err)
+	}
 
+	// The ostree deployment mount knows only ostree's layout; bootc
+	// itself mounts the deployment of a composefs installation.
+	if composefs {
+		mounts = append(mounts, *osbuild.NewBootcDeploymentMount("bootc.deployment", osbuild.OSTreeMountSourceMount))
+		mounts = append(mounts, *osbuild.NewBindMount("bind-bootc-deployment-to-tree", "mount://", "tree://"))
+	} else {
 		mounts = append(mounts, *osbuild.NewOSTreeDeploymentMountDefault("ostree.deployment", osbuild.OSTreeMountSourceMount))
 		mounts = append(mounts, *osbuild.NewBindMount("bind-ostree-deployment-to-tree", "mount://", "tree://"))
+	}
 
-		postStages := []*osbuild.Stage{}
+	postStages := []*osbuild.Stage{}
 
+	// With composefs, bootc finds the root and /boot without an fstab,
+	// and other mountpoints are refused when making the manifest.
+	if !composefs {
 		fsCfgStages, err := filesystemConfigStages(pt, p.DiskCustomizations.MountConfiguration)
 		if err != nil {
 			return osbuild.Pipeline{}, err
@@ -222,184 +230,186 @@ func (p *RawBootcImage) serialize() (osbuild.Pipeline, error) {
 			stage.Devices = devices
 			postStages = append(postStages, stage)
 		}
+	}
 
-		// customize the image
-		if len(p.OSCustomizations.Groups) > 0 {
-			groupsStage := osbuild.GenGroupsStage(p.OSCustomizations.Groups)
-			groupsStage.Mounts = mounts
-			groupsStage.Devices = devices
-			postStages = append(postStages, groupsStage)
+	// customize the image
+	if len(p.OSCustomizations.Groups) > 0 {
+		groupsStage := osbuild.GenGroupsStage(p.OSCustomizations.Groups)
+		groupsStage.Mounts = mounts
+		groupsStage.Devices = devices
+		postStages = append(postStages, groupsStage)
+	}
+
+	if len(p.OSCustomizations.Users) > 0 {
+		// ensure home root dir (currently /var/home, /var/roothome) is
+		// available
+		mkdirStage := osbuild.NewMkdirStage(&osbuild.MkdirStageOptions{
+			Paths: buildHomedirPaths(p.OSCustomizations.Users),
+		})
+		mkdirStage.Mounts = mounts
+		mkdirStage.Devices = devices
+		postStages = append(postStages, mkdirStage)
+
+		// add the users
+		usersStage, err := osbuild.GenUsersStage(p.OSCustomizations.Users, false)
+		if err != nil {
+			return osbuild.Pipeline{}, fmt.Errorf("user stage failed %w", err)
 		}
+		usersStage.Mounts = mounts
+		usersStage.Devices = devices
+		postStages = append(postStages, usersStage)
+	}
 
-		if len(p.OSCustomizations.Users) > 0 {
-			// ensure home root dir (currently /var/home, /var/roothome) is
-			// available
-			mkdirStage := osbuild.NewMkdirStage(&osbuild.MkdirStageOptions{
-				Paths: buildHomedirPaths(p.OSCustomizations.Users),
+	if p.LiveBoot {
+		// The dracut dmsquash-live module has a check for the root filesystem
+		// This is a kludge to work around this: On Fedora and RHEL10 it expects /usr in the root
+		// of the filesystem, and on RHEL9 it expects /proc
+		// dracut version 110 and later also checks for /ostree but we cannot depend on that
+		// version being available everywhere.
+		var dirNodes []*fsnode.Directory
+		for _, path := range []string{"/usr", "/proc"} {
+			d, err := fsnode.NewDirectory(path, common.ToPtr(os.FileMode(0755)), nil, nil, false)
+			if err != nil {
+				return osbuild.Pipeline{}, fmt.Errorf("directory failed %w", err)
+			}
+			dirNodes = append(dirNodes, d)
+		}
+		stages := osbuild.GenDirectoryNodesStages(dirNodes)
+
+		// NOTE this filters out the deployment mount, the /usr and /proc directories
+		// need to be in the root of the ostree filesystem, not in the deployment
+		var noDeploymentMounts []osbuild.Mount
+		for _, m := range mounts {
+			if m.Type == "org.osbuild.ostree.deployment" || m.Type == "org.osbuild.bootc.deployment" {
+				continue
+			}
+			noDeploymentMounts = append(noDeploymentMounts, m)
+		}
+		for _, stage := range stages {
+			stage.Mounts = noDeploymentMounts
+			stage.Devices = devices
+		}
+		postStages = append(postStages, stages...)
+	}
+
+	if p.OSCustomizations.Subscription != nil {
+		subStage, subDirs, subFiles, subServices, err := subscriptionService(
+			*p.OSCustomizations.Subscription,
+			&subscriptionServiceOptions{
+				// ostree based: unit in /etc (not /usr commit content),
+				// insights on boot
+				InsightsOnBoot: true,
+				UnitPath:       osbuild.EtcUnitPath,
+				// no-op for now: manifestForDisk never sets OSCustomizations.PermissiveRHC
+				PermissiveRHC: common.ValueOrEmpty(p.OSCustomizations.PermissiveRHC),
 			})
-			mkdirStage.Mounts = mounts
-			mkdirStage.Devices = devices
-			postStages = append(postStages, mkdirStage)
-
-			// add the users
-			usersStage, err := osbuild.GenUsersStage(p.OSCustomizations.Users, false)
-			if err != nil {
-				return osbuild.Pipeline{}, fmt.Errorf("user stage failed %w", err)
-			}
-			usersStage.Mounts = mounts
-			usersStage.Devices = devices
-			postStages = append(postStages, usersStage)
+		if err != nil {
+			return osbuild.Pipeline{}, err
 		}
 
-		if p.LiveBoot {
-			// The dracut dmsquash-live module has a check for the root filesystem
-			// This is a kludge to work around this: On Fedora and RHEL10 it expects /usr in the root
-			// of the filesystem, and on RHEL9 it expects /proc
-			// dracut version 110 and later also checks for /ostree but we cannot depend on that
-			// version being available everywhere.
-			var dirNodes []*fsnode.Directory
-			for _, path := range []string{"/usr", "/proc"} {
-				d, err := fsnode.NewDirectory(path, common.ToPtr(os.FileMode(0755)), nil, nil, false)
-				if err != nil {
-					return osbuild.Pipeline{}, fmt.Errorf("directory failed %w", err)
+		subFileStages, err := p.genFileStagesAndRecordInlineData(subFiles)
+		if err != nil {
+			return osbuild.Pipeline{}, err
+		}
+		stages := []*osbuild.Stage{subStage}
+		stages = append(stages, osbuild.GenDirectoryNodesStages(subDirs)...)
+		stages = append(stages, subFileStages...)
+		stages = append(stages, osbuild.NewSystemdStage(&osbuild.SystemdStageOptions{
+			EnabledServices: subServices,
+		}))
+		for _, stage := range stages {
+			stage.Mounts = mounts
+			stage.Devices = devices
+		}
+		postStages = append(postStages, stages...)
+	}
+
+	// First create custom directories, because some of the custom files may depend on them
+	if len(p.OSCustomizations.Directories) > 0 {
+
+		stages := osbuild.GenDirectoryNodesStages(p.OSCustomizations.Directories)
+		for _, stage := range stages {
+			stage.Mounts = mounts
+			stage.Devices = devices
+		}
+		postStages = append(postStages, stages...)
+	}
+
+	if len(p.OSCustomizations.Files) > 0 {
+		stages, err := p.genFileStagesAndRecordInlineData(p.OSCustomizations.Files)
+		if err != nil {
+			return osbuild.Pipeline{}, err
+		}
+		for _, stage := range stages {
+			stage.Mounts = mounts
+			stage.Devices = devices
+		}
+		postStages = append(postStages, stages...)
+	}
+
+	// The ignition stamp must be created after bootc install, otherwise bootc will error out
+	// because the boot partition is not empty.
+	// That's why we have to pass `mount://boot/` and can't write to `tree://boot/`.
+	// Ignition and the grub2 console configuration are not supported with
+	// composefs yet: /boot may be laid out differently (systemd-boot, UKIs).
+	if p.OSCustomizations.Ignition != nil && !composefs {
+		var ignitionStage *osbuild.Stage
+		if len(p.OSCustomizations.Ignition.ProvisioningURL) > 0 {
+			urls := strings.Fields(p.OSCustomizations.Ignition.ProvisioningURL)
+			opts := osbuild.IgnitionStageOptions{
+				Network: urls,
+				Target:  "mount://boot/",
+			}
+			ignitionStage = osbuild.NewIgnitionStage(&opts)
+		} else if p.OSCustomizations.Ignition.Empty {
+			opts := osbuild.IgnitionStageOptions{
+				Target: "mount://boot/",
+			}
+			ignitionStage = osbuild.NewIgnitionStage(&opts)
+		}
+		var err error
+		// We cannot reuse the existing mounts because the generated ostree mounts are shadowing /boot and the file ends up
+		// in the wrong place. We reuse the bootupd mount generator as it's enough for this. We just need /boot.
+		ignitionStage.Devices, ignitionStage.Mounts, err = osbuild.GenBootupdDevicesMounts(p.filename, p.PartitionTable, p.platform)
+		if err != nil {
+			return osbuild.Pipeline{}, fmt.Errorf("gen devices stage failed %w", err)
+		}
+		postStages = append(postStages, ignitionStage)
+	}
+
+	// Apply grub2 console configuration (terminal_input, terminal_output,
+	// serial) via the grub2.d stage which writes a drop-in config file
+	// under boot/grub2/. Like ignition, this writes to /boot so we use
+	// bootupd mounts.
+	if grub2dCfg := osbuild.NewGrub2DConfigFromGrub2Config(p.OSCustomizations.Grub2Config); grub2dCfg != nil && !composefs {
+		grub2dOpts := &osbuild.Grub2DStageOptions{
+			Config: grub2dCfg,
+			Path:   "tree:///boot/grub2/console.cfg",
+		}
+		grub2dStage := osbuild.NewGrub2DStage(grub2dOpts)
+		grub2dStage.Devices, grub2dStage.Mounts, err = osbuild.GenBootupdDevicesMounts(p.filename, p.PartitionTable, p.platform)
+		if err != nil {
+			return osbuild.Pipeline{}, fmt.Errorf("gen devices for grub2.d stage failed %w", err)
+		}
+		postStages = append(postStages, grub2dStage)
+	}
+
+	pipeline.AddStages(postStages...)
+
+	// In case we created any files in the deploy directory we need to relabel
+	// then per the selinux policy
+	if p.OSCustomizations.SELinux != "" {
+		if len(postStages) > 0 {
+			for _, changedFile := range []string{"/etc", "/var"} {
+				opts := &osbuild.SELinuxStageOptions{
+					Target:       "tree://" + changedFile,
+					FileContexts: fmt.Sprintf("etc/selinux/%s/contexts/files/file_contexts", p.OSCustomizations.SELinux),
+					ExcludePaths: []string{"/sysroot"},
 				}
-				dirNodes = append(dirNodes, d)
-			}
-			stages := osbuild.GenDirectoryNodesStages(dirNodes)
-
-			// NOTE this filters out the deployment mount, the /usr and /proc directories
-			// need to be in the root of the ostree filesystem, not in the deployment
-			var noDeploymentMounts []osbuild.Mount
-			for _, m := range mounts {
-				if m.Type == "org.osbuild.ostree.deployment" {
-					continue
-				}
-				noDeploymentMounts = append(noDeploymentMounts, m)
-			}
-			for _, stage := range stages {
-				stage.Mounts = noDeploymentMounts
-				stage.Devices = devices
-			}
-			postStages = append(postStages, stages...)
-		}
-
-		if p.OSCustomizations.Subscription != nil {
-			subStage, subDirs, subFiles, subServices, err := subscriptionService(
-				*p.OSCustomizations.Subscription,
-				&subscriptionServiceOptions{
-					// ostree based: unit in /etc (not /usr commit content),
-					// insights on boot
-					InsightsOnBoot: true,
-					UnitPath:       osbuild.EtcUnitPath,
-					// no-op for now: manifestForDisk never sets OSCustomizations.PermissiveRHC
-					PermissiveRHC: common.ValueOrEmpty(p.OSCustomizations.PermissiveRHC),
-				})
-			if err != nil {
-				return osbuild.Pipeline{}, err
-			}
-
-			subFileStages, err := p.genFileStagesAndRecordInlineData(subFiles)
-			if err != nil {
-				return osbuild.Pipeline{}, err
-			}
-			stages := []*osbuild.Stage{subStage}
-			stages = append(stages, osbuild.GenDirectoryNodesStages(subDirs)...)
-			stages = append(stages, subFileStages...)
-			stages = append(stages, osbuild.NewSystemdStage(&osbuild.SystemdStageOptions{
-				EnabledServices: subServices,
-			}))
-			for _, stage := range stages {
-				stage.Mounts = mounts
-				stage.Devices = devices
-			}
-			postStages = append(postStages, stages...)
-		}
-
-		// First create custom directories, because some of the custom files may depend on them
-		if len(p.OSCustomizations.Directories) > 0 {
-
-			stages := osbuild.GenDirectoryNodesStages(p.OSCustomizations.Directories)
-			for _, stage := range stages {
-				stage.Mounts = mounts
-				stage.Devices = devices
-			}
-			postStages = append(postStages, stages...)
-		}
-
-		if len(p.OSCustomizations.Files) > 0 {
-			stages, err := p.genFileStagesAndRecordInlineData(p.OSCustomizations.Files)
-			if err != nil {
-				return osbuild.Pipeline{}, err
-			}
-			for _, stage := range stages {
-				stage.Mounts = mounts
-				stage.Devices = devices
-			}
-			postStages = append(postStages, stages...)
-		}
-
-		// The ignition stamp must be created after bootc install, otherwise bootc will error out
-		// because the boot partition is not empty.
-		// That's why we have to pass `mount://boot/` and can't write to `tree://boot/`.
-		if p.OSCustomizations.Ignition != nil {
-			var ignitionStage *osbuild.Stage
-			if len(p.OSCustomizations.Ignition.ProvisioningURL) > 0 {
-				urls := strings.Fields(p.OSCustomizations.Ignition.ProvisioningURL)
-				opts := osbuild.IgnitionStageOptions{
-					Network: urls,
-					Target:  "mount://boot/",
-				}
-				ignitionStage = osbuild.NewIgnitionStage(&opts)
-			} else if p.OSCustomizations.Ignition.Empty {
-				opts := osbuild.IgnitionStageOptions{
-					Target: "mount://boot/",
-				}
-				ignitionStage = osbuild.NewIgnitionStage(&opts)
-			}
-			var err error
-			// We cannot reuse the existing mounts because the generated ostree mounts are shadowing /boot and the file ends up
-			// in the wrong place. We reuse the bootupd mount generator as it's enough for this. We just need /boot.
-			ignitionStage.Devices, ignitionStage.Mounts, err = osbuild.GenBootupdDevicesMounts(p.filename, p.PartitionTable, p.platform)
-			if err != nil {
-				return osbuild.Pipeline{}, fmt.Errorf("gen devices stage failed %w", err)
-			}
-			postStages = append(postStages, ignitionStage)
-		}
-
-		// Apply grub2 console configuration (terminal_input, terminal_output,
-		// serial) via the grub2.d stage which writes a drop-in config file
-		// under boot/grub2/. Like ignition, this writes to /boot so we use
-		// bootupd mounts.
-		if grub2dCfg := osbuild.NewGrub2DConfigFromGrub2Config(p.OSCustomizations.Grub2Config); grub2dCfg != nil {
-			grub2dOpts := &osbuild.Grub2DStageOptions{
-				Config: grub2dCfg,
-				Path:   "tree:///boot/grub2/console.cfg",
-			}
-			grub2dStage := osbuild.NewGrub2DStage(grub2dOpts)
-			grub2dStage.Devices, grub2dStage.Mounts, err = osbuild.GenBootupdDevicesMounts(p.filename, p.PartitionTable, p.platform)
-			if err != nil {
-				return osbuild.Pipeline{}, fmt.Errorf("gen devices for grub2.d stage failed %w", err)
-			}
-			postStages = append(postStages, grub2dStage)
-		}
-
-		pipeline.AddStages(postStages...)
-
-		// In case we created any files in the deploy directory we need to relabel
-		// then per the selinux policy
-		if p.OSCustomizations.SELinux != "" {
-			if len(postStages) > 0 {
-				for _, changedFile := range []string{"/etc", "/var"} {
-					opts := &osbuild.SELinuxStageOptions{
-						Target:       "tree://" + changedFile,
-						FileContexts: fmt.Sprintf("etc/selinux/%s/contexts/files/file_contexts", p.OSCustomizations.SELinux),
-						ExcludePaths: []string{"/sysroot"},
-					}
-					selinuxStage := osbuild.NewSELinuxStage(opts)
-					selinuxStage.Mounts = mounts
-					selinuxStage.Devices = devices
-					pipeline.AddStage(selinuxStage)
-				}
+				selinuxStage := osbuild.NewSELinuxStage(opts)
+				selinuxStage.Mounts = mounts
+				selinuxStage.Devices = devices
+				pipeline.AddStage(selinuxStage)
 			}
 		}
 	}

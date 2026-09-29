@@ -762,9 +762,9 @@ func TestManifestComposefsCustomizationsWarn(t *testing.T) {
 				Disk: &blueprint.DiskCustomization{Partitions: []blueprint.PartitionCustomization{rootPart}},
 			},
 		},
+		// applied to /etc and /var through the bootc deployment mount
 		"user": {
 			customizations: &blueprint.Customizations{User: []blueprint.UserCustomization{{Name: "alice"}}},
-			expected:       "customizations.user",
 		},
 		"kargs": {
 			customizations: &blueprint.Customizations{Kernel: &blueprint.KernelCustomization{Append: "debug"}},
@@ -773,14 +773,12 @@ func TestManifestComposefsCustomizationsWarn(t *testing.T) {
 		},
 		"group": {
 			customizations: &blueprint.Customizations{Group: []blueprint.GroupCustomization{{Name: "wheel2"}}},
-			expected:       "customizations.group",
 		},
 		"files-and-dirs": {
 			customizations: &blueprint.Customizations{
 				Directories: []blueprint.DirectoryCustomization{{Path: "/etc/foo"}},
 				Files:       []blueprint.FileCustomization{{Path: "/etc/foo/bar", Data: "baz"}},
 			},
-			expected: "customizations.directories, customizations.files",
 		},
 		"ignition": {
 			customizations: &blueprint.Customizations{
@@ -796,7 +794,6 @@ func TestManifestComposefsCustomizationsWarn(t *testing.T) {
 			options: distro.ImageOptions{
 				Subscription: &subscription.ImageOptions{Organization: "2040324", ActivationKey: "my-secret-key"},
 			},
-			expected: "subscription",
 		},
 		"disk-extra-mountpoint": {
 			customizations: &blueprint.Customizations{

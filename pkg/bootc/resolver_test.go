@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"testing"
+	"testing/fstest"
 
 	"github.com/osbuild/image-builder/internal/common"
 	"github.com/osbuild/image-builder/pkg/bootc"
@@ -280,5 +281,31 @@ echo '%s'
 		installConfig, err := cnt.InstallConfiguration()
 		assert.NoError(t, err)
 		assert.Equal(t, tc.Out, installConfig.Bootloader)
+	}
+}
+
+func TestComposefsBackend(t *testing.T) {
+	const setupRoot = "usr/lib/composefs/setup-root-conf.toml"
+	const ostreeConf = "usr/lib/ostree/prepare-root.conf"
+	const ostreeConfEtc = "etc/ostree/prepare-root.conf"
+	for _, tc := range []struct {
+		files    []string
+		expected bool
+	}{
+		{nil, false},
+		{[]string{setupRoot}, true},
+		{[]string{ostreeConf}, false},
+		{[]string{ostreeConfEtc}, false},
+		{[]string{setupRoot, ostreeConf}, false},
+		{[]string{setupRoot, ostreeConfEtc}, false},
+	} {
+		root := fstest.MapFS{}
+		for _, f := range tc.files {
+			// both files count even when empty
+			root[f] = &fstest.MapFile{}
+		}
+		composefs, err := bootc.ComposefsBackend(root)
+		require.NoError(t, err)
+		assert.Equal(t, tc.expected, composefs, tc.files)
 	}
 }

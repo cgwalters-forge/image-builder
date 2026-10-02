@@ -30,4 +30,9 @@ type Info struct {
 
 	// What bootloader should be passed?
 	Bootloader *string
+
+	// Is the container built for the composefs backend (it ships
+	// setup-root-conf.toml and no ostree prepare-root.conf)? A unified
+	// kernel implies the composefs backend regardless of this setting.
+	ComposefsBackend bool
 }

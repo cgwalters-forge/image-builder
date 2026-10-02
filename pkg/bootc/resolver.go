@@ -235,6 +235,12 @@ func (c *Container) ResolveInfo(variant string) (*Info, error) {
 	bootcInfo.DefaultRootFs = bootcInstallConfig.Filesystem.Root.Type
 	bootcInfo.Bootloader = bootcInstallConfig.Bootloader
 
+	composefs, err := composefsBackend(c.RootFS())
+	if err != nil {
+		return nil, err
+	}
+	bootcInfo.ComposefsBackend = composefs
+
 	unifiedKernel, err := c.UnifiedKernel()
 	if err != nil {
 		return nil, err
@@ -380,6 +386,48 @@ func (c *Container) InitrdModules(kver string) ([]string, error) {
 	}
 
 	return strings.Split(strings.TrimRight(string(output), "\n"), "\n"), nil
+}
+
+// setupRootConfPath is the configuration of bootc's composefs root setup.
+// bootc treats a container that ships it, even empty, as built for the
+// composefs backend, see bootc-setup-root-conf.toml(5).
+const setupRootConfPath = "usr/lib/composefs/setup-root-conf.toml"
+
+// ostreePrepareRootConfPaths are the locations of ostree's
+// prepare-root.conf, without which a container can't be installed with the
+// ostree backend.
+var ostreePrepareRootConfPaths = []string{
+	"etc/ostree/prepare-root.conf",
+	"usr/lib/ostree/prepare-root.conf",
+}
+
+// composefsBackend finds out if bootc installs the container with the
+// composefs backend even without a unified kernel: it does so when the
+// container has a setup-root-conf.toml and no ostree prepare-root.conf, see
+// "The storage backend" in bootc-installation(7).
+func composefsBackend(root fs.FS) (bool, error) {
+	native, err := fileExists(root, setupRootConfPath)
+	if err != nil || !native {
+		return false, err
+	}
+	for _, path := range ostreePrepareRootConfPaths {
+		hasOstree, err := fileExists(root, path)
+		if err != nil || hasOstree {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func fileExists(root fs.FS, name string) (bool, error) {
+	_, err := fs.Stat(root, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("checking for /%s in the container failed: %w", name, err)
+	}
+	return true, nil
 }
 
 // UnifiedKernel finds out if the kernel inside the bootc container is unified

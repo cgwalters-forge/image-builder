@@ -30,4 +30,9 @@ type Info struct {
 
 	// What bootloader should be passed?
 	Bootloader *string
+
+	// Does the container's bootc have "bootc install mount"? Its
+	// deployment can then be mounted with the org.osbuild.bootc.deployment
+	// mount, whatever the storage backend, when it is the build root.
+	InstallMount bool
 }

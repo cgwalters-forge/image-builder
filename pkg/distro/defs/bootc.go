@@ -26,6 +26,8 @@ type BootcDistro struct {
 	buildSourceInfo *osinfo.Info
 	unifiedKernel   bool
 	bootloader      *string
+	// the build container's bootc has "bootc install mount"
+	installMount bool
 
 	id            distro.ID
 	defaultFs     string
@@ -140,6 +142,7 @@ func NewBootcWithLoader(loader *Loader, name string, cinfo *bootc.Info) (*BootcD
 		rootfsMinSize:   cinfo.Size * containerSizeToDiskSizeMultiplier,
 		bootloader:      cinfo.Bootloader,
 		unifiedKernel:   cinfo.UnifiedKernel,
+		installMount:    cinfo.InstallMount,
 	}
 
 	// load image types from bootc-generic-1
@@ -299,6 +302,7 @@ func (d *BootcDistro) SetBuildContainer(cinfo *bootc.Info) error {
 	d.buildImgref = cinfo.Imgref
 	d.buildImageID = cinfo.ImageID
 	d.buildSourceInfo = cinfo.OSInfo
+	d.installMount = cinfo.InstallMount
 
 	return nil
 }

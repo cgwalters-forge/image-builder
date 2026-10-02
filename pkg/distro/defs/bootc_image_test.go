@@ -875,6 +875,9 @@ func TestManifestUnifiedKernelCustomizationsWarn(t *testing.T) {
 		customizations *blueprint.Customizations
 		options        distro.ImageOptions
 		expected       string
+		// what is left when the build container's bootc has "install
+		// mount", which mounts the deployment for /etc and /var
+		expectedInstallMount string
 	}{
 		"empty": {},
 		"disk-root-only": {
@@ -887,46 +890,51 @@ func TestManifestUnifiedKernelCustomizationsWarn(t *testing.T) {
 				User:   []blueprint.UserCustomization{{Name: "alice"}},
 				Kernel: &blueprint.KernelCustomization{Append: "debug"},
 			},
-			expected: "customizations.user, customizations.kernel.append",
+			expected:             "customizations.user, customizations.kernel.append (" + ukiNeedsInstallMount + ")",
+			expectedInstallMount: "customizations.kernel.append",
 		},
 		"group": {
 			customizations: &blueprint.Customizations{Group: []blueprint.GroupCustomization{{Name: "wheel2"}}},
-			expected:       "customizations.group",
+			expected:       "customizations.group (" + ukiNeedsInstallMount + ")",
 		},
 		"files-and-dirs": {
 			customizations: &blueprint.Customizations{
 				Directories: []blueprint.DirectoryCustomization{{Path: "/etc/foo"}},
 				Files:       []blueprint.FileCustomization{{Path: "/etc/foo/bar", Data: "baz"}},
 			},
-			expected: "customizations.directories, customizations.files",
+			expected: "customizations.directories, customizations.files (" + ukiNeedsInstallMount + ")",
 		},
 		"ignition": {
 			customizations: &blueprint.Customizations{
 				Ignition: &blueprint.IgnitionCustomization{FirstBoot: &blueprint.FirstBootIgnitionCustomization{ProvisioningURL: "https://example.com/config.ign"}},
 			},
-			expected: "customizations.ignition",
+			expected:             "customizations.ignition",
+			expectedInstallMount: "customizations.ignition",
 		},
 		"bootloader": {
-			customizations: getBootloaderConfig().Customizations,
-			expected:       "customizations.bootloader",
+			customizations:       getBootloaderConfig().Customizations,
+			expected:             "customizations.bootloader",
+			expectedInstallMount: "customizations.bootloader",
 		},
 		"subscription": {
 			options: distro.ImageOptions{
 				Subscription: &subscription.ImageOptions{Organization: "2040324", ActivationKey: "my-secret-key"},
 			},
-			expected: "subscription",
+			expected: "subscription (" + ukiNeedsInstallMount + ")",
 		},
 		"disk-extra-mountpoint": {
 			customizations: &blueprint.Customizations{
 				Disk: &blueprint.DiskCustomization{Partitions: []blueprint.PartitionCustomization{rootPart, dataPart}},
 			},
-			expected: "customizations.disk mountpoints without an fstab (/var/data)",
+			expected:             "customizations.disk mountpoints without an fstab (/var/data)",
+			expectedInstallMount: "customizations.disk mountpoints without an fstab (/var/data)",
 		},
 		"filesystem-extra-mountpoint": {
 			customizations: &blueprint.Customizations{
 				Filesystem: []blueprint.FilesystemCustomization{{Mountpoint: "/", MinSize: datasizes.GiB}, {Mountpoint: "/var/data", MinSize: datasizes.GiB}},
 			},
-			expected: "customizations.filesystem mountpoints without an fstab (/var/data)",
+			expected:             "customizations.filesystem mountpoints without an fstab (/var/data)",
+			expectedInstallMount: "customizations.filesystem mountpoints without an fstab (/var/data)",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -946,11 +954,19 @@ func TestManifestUnifiedKernelCustomizationsWarn(t *testing.T) {
 			// without a UKI all of these are applied
 			assert.Empty(t, ukiWarnings())
 
-			imgType.arch.distro.(*BootcDistro).unifiedKernel = true
-			if tc.expected == "" {
-				assert.Empty(t, ukiWarnings())
-			} else {
-				assert.Equal(t, []string{warnPrefix + tc.expected}, ukiWarnings())
+			bd := imgType.arch.distro.(*BootcDistro)
+			bd.unifiedKernel = true
+			for _, installMount := range []bool{false, true} {
+				bd.installMount = installMount
+				expected := tc.expected
+				if installMount {
+					expected = tc.expectedInstallMount
+				}
+				if expected == "" {
+					assert.Empty(t, ukiWarnings(), "install mount: %v", installMount)
+				} else {
+					assert.Equal(t, []string{warnPrefix + expected}, ukiWarnings(), "install mount: %v", installMount)
+				}
 			}
 		})
 	}

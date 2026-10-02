@@ -261,6 +261,7 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 
 	img.Bootloader = bd.bootloader
 	img.UnifiedKernel = bd.unifiedKernel
+	img.InstallMount = bd.installMount
 
 	img.OSCustomizations.Subscription = options.Subscription
 	img.OSCustomizations.Users = users.UsersFromBP(customizations.GetUsers())
@@ -317,7 +318,7 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 
 	var warnings []string
 	if bd.unifiedKernel {
-		warnings, err = t.checkUnifiedKernelCustomizations(customizations, options)
+		warnings, err = t.checkUnifiedKernelCustomizations(customizations, options, bd.installMount)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -876,32 +877,42 @@ func diskCustomizationMountpoints(dc *blueprint.DiskCustomization) []string {
 	return slices.DeleteFunc(mountpoints, func(mnt string) bool { return mnt == "" })
 }
 
+// ukiNeedsInstallMount explains how to get the /etc and /var customizations
+// of an image with a unified kernel applied.
+const ukiNeedsInstallMount = `customizing /etc and /var needs "bootc install mount" in the build container's bootc`
+
 // checkUnifiedKernelCustomizations returns a warning for the customizations
 // that a disk image with a unified kernel (UKI) cannot apply. Its kernel
-// command line is embedded in the signed UKI and nothing is written into the
-// deployment after "bootc install", so these would otherwise be dropped
-// silently. Like other blueprint validation failures this is a warning, which
-// image-builder turns into an error unless --ignore-warnings is given.
-// TODO: support /etc and /var customizations, see
-// https://github.com/osbuild/image-builder/issues/2560
-func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *blueprint.Customizations, options distro.ImageOptions) ([]string, error) {
+// command line is embedded in the signed UKI, and without "bootc install
+// mount" in the build container nothing is written into the deployment after
+// "bootc install", so these would otherwise be dropped silently. Like other
+// blueprint validation failures this is a warning, which image-builder turns
+// into an error unless --ignore-warnings is given.
+func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *blueprint.Customizations, options distro.ImageOptions, installMount bool) ([]string, error) {
 	var unsupported []string
-	if len(customizations.GetUsers()) > 0 {
-		unsupported = append(unsupported, "customizations.user")
+	// with "bootc install mount", these go into the deployment's /etc and /var
+	if !installMount {
+		if len(customizations.GetUsers()) > 0 {
+			unsupported = append(unsupported, "customizations.user")
+		}
+		groups, err := customizations.GetGroups()
+		if err != nil {
+			return nil, err
+		}
+		if len(groups) > 0 {
+			unsupported = append(unsupported, "customizations.group")
+		}
+		if len(customizations.GetDirectories()) > 0 {
+			unsupported = append(unsupported, "customizations.directories")
+		}
+		if len(customizations.GetFiles()) > 0 {
+			unsupported = append(unsupported, "customizations.files")
+		}
+		if options.Subscription != nil {
+			unsupported = append(unsupported, "subscription")
+		}
 	}
-	groups, err := customizations.GetGroups()
-	if err != nil {
-		return nil, err
-	}
-	if len(groups) > 0 {
-		unsupported = append(unsupported, "customizations.group")
-	}
-	if len(customizations.GetDirectories()) > 0 {
-		unsupported = append(unsupported, "customizations.directories")
-	}
-	if len(customizations.GetFiles()) > 0 {
-		unsupported = append(unsupported, "customizations.files")
-	}
+	needInstallMount := len(unsupported) > 0
 	if kernel := customizations.GetKernel(); kernel != nil && kernel.Append != "" {
 		unsupported = append(unsupported, "customizations.kernel.append")
 	}
@@ -914,9 +925,6 @@ func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *bluepr
 	}
 	if customizations.GetBootloader() != nil {
 		unsupported = append(unsupported, "customizations.bootloader")
-	}
-	if options.Subscription != nil {
-		unsupported = append(unsupported, "subscription")
 	}
 
 	// Filesystem and disk customizations are fine as long as their
@@ -940,7 +948,11 @@ func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *bluepr
 	if len(unsupported) == 0 {
 		return nil, nil
 	}
-	return []string{fmt.Sprintf("blueprint validation failed for image type %q: the bootc container has a unified kernel (UKI), which does not support: %s", t.Name(), strings.Join(unsupported, ", "))}, nil
+	warning := fmt.Sprintf("blueprint validation failed for image type %q: the bootc container has a unified kernel (UKI), which does not support: %s", t.Name(), strings.Join(unsupported, ", "))
+	if needInstallMount {
+		warning += fmt.Sprintf(" (%s)", ukiNeedsInstallMount)
+	}
+	return []string{warning}, nil
 }
 
 func PlatformFor(archStr, uefiVendor string) *platform.Data {

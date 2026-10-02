@@ -2,8 +2,10 @@ package manifest_test
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -641,6 +643,91 @@ func TestRawBootcPXE(t *testing.T) {
 	require.NotEmpty(t, mkdirPaths)
 	assert.Contains(t, mkdirPaths, "/usr")
 	assert.Contains(t, mkdirPaths, "/proc")
+}
+
+func TestRawBootcImageSerializeDeploymentMount(t *testing.T) {
+	const (
+		ostreeMount = "org.osbuild.ostree.deployment"
+		bootcMount  = "org.osbuild.bootc.deployment"
+	)
+	for _, tc := range []struct {
+		name          string
+		unifiedKernel bool
+		installMount  bool
+		// the deployment mount of the customization stages, none if
+		// they are skipped
+		expectedMount string
+	}{
+		{"ostree-mount", false, false, ostreeMount},
+		{"install-mount", false, true, bootcMount},
+		{"uki", true, false, ""},
+		{"uki-install-mount", true, true, bootcMount},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serialize := func(customize bool) *osbuild.Pipeline {
+				rawBootcPipeline := makeFakeRawBootcPipeline()
+				rawBootcPipeline.UnifiedKernel = tc.unifiedKernel
+				rawBootcPipeline.InstallMount = tc.installMount
+				rawBootcPipeline.OSCustomizations.SELinux = "targeted"
+				// set by image definitions rather than the user
+				rawBootcPipeline.OSCustomizations.Grub2Config = &osbuild.GRUB2Config{
+					Serial: "serial --unit=0 --speed=115200",
+				}
+				rawBootcPipeline.DiskCustomizations.MountConfiguration = osbuild.MOUNT_CONFIGURATION_FSTAB
+				if customize {
+					rawBootcPipeline.OSCustomizations.Users = []users.User{{Name: "foo"}}
+				}
+				pipeline, err := rawBootcPipeline.Serialize()
+				require.NoError(t, err)
+				return &pipeline
+			}
+			deploymentMounts := func(pipeline *osbuild.Pipeline) map[string]int {
+				found := map[string]int{}
+				for _, stage := range pipeline.Stages {
+					for _, mntType := range []string{ostreeMount, bootcMount} {
+						if findMountIdx(stage.Mounts, mntType) >= 0 {
+							found[mntType]++
+						}
+					}
+				}
+				return found
+			}
+
+			pipeline := serialize(true)
+			usersStages := findPostInstallStages("org.osbuild.users", pipeline.Stages)
+			if tc.expectedMount == "" {
+				assert.Empty(t, usersStages)
+				assert.Empty(t, deploymentMounts(pipeline))
+			} else {
+				require.Len(t, usersStages, 1)
+				mounts := usersStages[0].Mounts
+				deploymentIdx := findMountIdx(mounts, tc.expectedMount)
+				require.GreaterOrEqual(t, deploymentIdx, 0)
+				// the bind to the tree must come after the deployment
+				assert.Greater(t, findMountIdx(mounts, "org.osbuild.bind"), deploymentIdx)
+				// all stages use the same deployment mount
+				assert.Equal(t, []string{tc.expectedMount}, slices.Collect(maps.Keys(deploymentMounts(pipeline))))
+			}
+
+			// With a unified kernel, there is no fstab and no grub2
+			// console configuration, and nothing is done after the
+			// install without customizations: the manifest doesn't
+			// change with "bootc install mount" then.
+			for _, stageType := range []string{"org.osbuild.fstab", "org.osbuild.grub2.d"} {
+				stages := findPostInstallStages(stageType, pipeline.Stages)
+				if tc.unifiedKernel {
+					assert.Empty(t, stages, stageType)
+				} else {
+					assert.Len(t, stages, 1, stageType)
+				}
+			}
+			if tc.unifiedKernel {
+				pipeline := serialize(false)
+				assert.Empty(t, deploymentMounts(pipeline))
+				assert.Empty(t, findPostInstallStages("org.osbuild.selinux", pipeline.Stages))
+			}
+		})
+	}
 }
 
 func TestRawBootcImageSerializeSubscriptionManagerCommands(t *testing.T) {

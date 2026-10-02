@@ -363,6 +363,36 @@ func TestManifestGeneratorDepsolveOutput(t *testing.T) {
 	assert.Equal(t, []byte("fake depsolve output"), depsolveWarningsOutput.Bytes())
 }
 
+func TestManifestGeneratorWarningsOutput(t *testing.T) {
+	repos, err := testrepos.New()
+	require.NoError(t, err)
+	filter, err := imagefilter.New(distrofactory.NewDefault(), repos)
+	require.NoError(t, err)
+	res, err := filter.Filter("distro:centos-9", "type:qcow2", "arch:x86_64")
+	require.NoError(t, err)
+	require.Equal(t, 1, len(res))
+
+	// an installer customization is not supported for qcow2 images
+	bp := blueprint.Blueprint{
+		Customizations: &blueprint.Customizations{
+			Installer: &blueprint.InstallerCustomization{Unattended: true},
+		},
+	}
+
+	// without a warnings output, warnings are errors
+	mg, err := manifestgen.New(repos, &manifestgen.Options{Depsolve: fakeDepsolve})
+	require.NoError(t, err)
+	_, err = mg.Generate(&bp, res[0].ImgType, nil)
+	assert.ErrorContains(t, err, "Warnings during manifest creation:\nblueprint validation failed")
+
+	var warningsOutput bytes.Buffer
+	mg, err = manifestgen.New(repos, &manifestgen.Options{Depsolve: fakeDepsolve, WarningsOutput: &warningsOutput})
+	require.NoError(t, err)
+	_, err = mg.Generate(&bp, res[0].ImgType, nil)
+	require.NoError(t, err)
+	assert.Regexp(t, `^WARNING: blueprint validation failed for image type "qcow2": .*installer.*\n$`, warningsOutput.String())
+}
+
 func TestManifestGeneratorOverrideRepos(t *testing.T) {
 	repos, err := testrepos.New()
 	assert.NoError(t, err)

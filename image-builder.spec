@@ -69,7 +69,9 @@ cd $GO_BUILD_PATH/src/%{goipath}
 install -m 0755 -vd _bin
 export PATH=$PWD/_bin${PATH:+:$PATH}
 export GOPATH=$GO_BUILD_PATH:%{gopath}
-export GOFLAGS+=" -mod=vendor"
+# RHEL's go defaults to GOFIPS140=certified and unpacks that snapshot, read-only,
+# into the module cache under $GO_BUILD_PATH; keep it writable for rpmbuild cleanup.
+export GOFLAGS+=" -mod=vendor -modcacherw"
 %endif
 
 %if 0%{?fedora}
@@ -96,7 +98,7 @@ install -m 0644 -vp man/man1/image-builder*.1       %{buildroot}%{_mandir}/man1/
 %check
 export GOFLAGS="-buildmode=pie"
 %if 0%{?rhel}
-export GOFLAGS+=" -mod=vendor"
+export GOFLAGS+=" -mod=vendor -modcacherw"
 export GOPATH=$PWD/_build:%{gopath}
 # cd inside GOPATH, otherwise go with GO111MODULE=off ignores vendor directory
 cd $PWD/_build/src/%{goipath}

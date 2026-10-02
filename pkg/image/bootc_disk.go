@@ -23,6 +23,8 @@ type BootcDiskImage struct {
 
 	Bootloader    *string
 	UnifiedKernel bool
+	// The build container's bootc has "bootc install mount"
+	InstallMount bool
 
 	Partitions []PartitionConfig
 
@@ -114,6 +116,7 @@ func (img *BootcDiskImage) InstantiateManifestFromContainers(m *manifest.Manifes
 	}
 	rawImage.Bootloader = img.Bootloader
 	rawImage.UnifiedKernel = img.UnifiedKernel
+	rawImage.InstallMount = img.InstallMount
 	rawImage.PartitionTable = img.PartitionTable
 	rawImage.OSCustomizations = img.OSCustomizations
 	rawImage.DiskCustomizations = img.DiskCustomizations

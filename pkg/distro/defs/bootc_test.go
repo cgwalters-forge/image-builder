@@ -464,6 +464,8 @@ func TestSetBuildContainer(t *testing.T) {
 		Arch:          "aarch64",
 		DefaultRootFs: "xfs",
 		Size:          100 * datasizes.MiB,
+		// the build container's bootc is the one that counts
+		InstallMount: true,
 		OSInfo: &osinfo.Info{
 			OSRelease: osinfo.OSRelease{
 				ID:        "whatever",
@@ -477,6 +479,8 @@ func TestSetBuildContainer(t *testing.T) {
 		expectedImgref  string
 		expectedImageID string
 		expectedError   string
+
+		expectedInstallMount bool
 	}
 
 	testCases := map[string]testCase{
@@ -486,12 +490,14 @@ func TestSetBuildContainer(t *testing.T) {
 
 		"ok": {
 			buildInfo: &bootc.Info{
-				Imgref:  "example.com/containers/distro-bootc:build42",
-				ImageID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-				Arch:    "arm64",
+				Imgref:       "example.com/containers/distro-bootc:build42",
+				ImageID:      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				Arch:         "arm64",
+				InstallMount: true,
 			},
-			expectedImgref:  "example.com/containers/distro-bootc:build42",
-			expectedImageID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			expectedImgref:       "example.com/containers/distro-bootc:build42",
+			expectedImageID:      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			expectedInstallMount: true,
 		},
 
 		"noimgref": {
@@ -541,6 +547,7 @@ func TestSetBuildContainer(t *testing.T) {
 
 			require.Equal(tc.expectedImgref, bd.buildImgref)
 			require.Equal(tc.expectedImageID, bd.buildImageID)
+			require.Equal(tc.expectedInstallMount, bd.installMount)
 		})
 	}
 }

@@ -39,6 +39,12 @@ type RawBootcImage struct {
 	UnifiedKernel bool
 	Bootloader    *string
 
+	// The build root's bootc has "bootc install mount": the customization
+	// stages then mount the deployment with it, whatever the storage
+	// backend. Otherwise they mount it as an ostree deployment, and with a
+	// unified kernel (which means composefs) they are skipped.
+	InstallMount bool
+
 	// customizations go here because there is no intermediate
 	// tree, with `bootc install to-filesystem` we can only work
 	// with the image itself
@@ -196,7 +202,7 @@ func (p *RawBootcImage) serialize() (osbuild.Pipeline, error) {
 		pipeline.AddStage(stage)
 	}
 
-	if !p.UnifiedKernel {
+	if p.InstallMount || !p.UnifiedKernel {
 		// all our customizations work directly on the mounted deployment
 		// root from the image so generate the devices/mounts for all
 		devices, mounts, err = osbuild.GenBootupdDevicesMounts(p.filename, p.PartitionTable, p.platform)
@@ -204,19 +210,32 @@ func (p *RawBootcImage) serialize() (osbuild.Pipeline, error) {
 			return osbuild.Pipeline{}, fmt.Errorf("gen devices stage failed %w", err)
 		}
 
-		mounts = append(mounts, *osbuild.NewOSTreeDeploymentMountDefault("ostree.deployment", osbuild.OSTreeMountSourceMount))
-		mounts = append(mounts, *osbuild.NewBindMount("bind-ostree-deployment-to-tree", "mount://", "tree://"))
+		var deploymentMount osbuild.Mount
+		if p.InstallMount {
+			deploymentMount = *osbuild.NewBootcDeploymentMount("bootc.deployment", osbuild.OSTreeMountSourceMount)
+			mounts = append(mounts, deploymentMount)
+			mounts = append(mounts, *osbuild.NewBindMount("bind-bootc-deployment-to-tree", "mount://", "tree://"))
+		} else {
+			deploymentMount = *osbuild.NewOSTreeDeploymentMountDefault("ostree.deployment", osbuild.OSTreeMountSourceMount)
+			mounts = append(mounts, deploymentMount)
+			mounts = append(mounts, *osbuild.NewBindMount("bind-ostree-deployment-to-tree", "mount://", "tree://"))
+		}
 
 		postStages := []*osbuild.Stage{}
 
-		fsCfgStages, err := filesystemConfigStages(pt, p.DiskCustomizations.MountConfiguration)
-		if err != nil {
-			return osbuild.Pipeline{}, err
-		}
-		for _, stage := range fsCfgStages {
-			stage.Mounts = mounts
-			stage.Devices = devices
-			postStages = append(postStages, stage)
+		// With a unified kernel, systemd-gpt-auto-generator finds the
+		// root and /boot from their partition types, and other mountpoints
+		// are refused when making the manifest.
+		if !p.UnifiedKernel {
+			fsCfgStages, err := filesystemConfigStages(pt, p.DiskCustomizations.MountConfiguration)
+			if err != nil {
+				return osbuild.Pipeline{}, err
+			}
+			for _, stage := range fsCfgStages {
+				stage.Mounts = mounts
+				stage.Devices = devices
+				postStages = append(postStages, stage)
+			}
 		}
 
 		// customize the image
@@ -267,7 +286,7 @@ func (p *RawBootcImage) serialize() (osbuild.Pipeline, error) {
 			// need to be in the root of the ostree filesystem, not in the deployment
 			var noDeploymentMounts []osbuild.Mount
 			for _, m := range mounts {
-				if m.Type == "org.osbuild.ostree.deployment" {
+				if m.Type == deploymentMount.Type {
 					continue
 				}
 				noDeploymentMounts = append(noDeploymentMounts, m)
@@ -337,7 +356,10 @@ func (p *RawBootcImage) serialize() (osbuild.Pipeline, error) {
 		// The ignition stamp must be created after bootc install, otherwise bootc will error out
 		// because the boot partition is not empty.
 		// That's why we have to pass `mount://boot/` and can't write to `tree://boot/`.
-		if p.OSCustomizations.Ignition != nil {
+		// Ignition and the grub2 console configuration are not supported
+		// with a unified kernel: bootc installs it into the ESP and /boot
+		// is laid out differently.
+		if p.OSCustomizations.Ignition != nil && !p.UnifiedKernel {
 			var ignitionStage *osbuild.Stage
 			if len(p.OSCustomizations.Ignition.ProvisioningURL) > 0 {
 				urls := strings.Fields(p.OSCustomizations.Ignition.ProvisioningURL)
@@ -366,7 +388,7 @@ func (p *RawBootcImage) serialize() (osbuild.Pipeline, error) {
 		// serial) via the grub2.d stage which writes a drop-in config file
 		// under boot/grub2/. Like ignition, this writes to /boot so we use
 		// bootupd mounts.
-		if grub2dCfg := osbuild.NewGrub2DConfigFromGrub2Config(p.OSCustomizations.Grub2Config); grub2dCfg != nil {
+		if grub2dCfg := osbuild.NewGrub2DConfigFromGrub2Config(p.OSCustomizations.Grub2Config); grub2dCfg != nil && !p.UnifiedKernel {
 			grub2dOpts := &osbuild.Grub2DStageOptions{
 				Config: grub2dCfg,
 				Path:   "tree:///boot/grub2/console.cfg",

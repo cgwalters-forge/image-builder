@@ -17,6 +17,11 @@ func fakeBootc() error {
 		fmt.Println(`{"kernel": {"unified": false}}`)
 		return nil
 	}
+	if len(os.Args) >= 3 && os.Args[1] == "install" && os.Args[2] == "mount" {
+		// like a bootc without "install mount": clap's usage error
+		fmt.Fprintln(os.Stderr, "error: unrecognized subcommand 'mount'")
+		os.Exit(2)
+	}
 	return fmt.Errorf("unexpected bootc arguments %v", os.Args)
 }
 

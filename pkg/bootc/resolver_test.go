@@ -259,6 +259,34 @@ func TestUnifiedKernelHappy(t *testing.T) {
 	}
 }
 
+func TestHasInstallMount(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		exitCode int
+		expected bool
+		errMsg   string
+	}{
+		{"supported", 0, true, ""},
+		{"unknown command", 2, false, ""},
+		{"error", 1, false, "failed to run bootc install mount --help"},
+		{"no bootc", 127, false, "failed to run bootc install mount --help"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			makeFakePodman(t, fmt.Sprintf(`#!/bin/sh
+				exit %d
+				`, tc.exitCode))
+			cnt := bootc.Container{}
+			installMount, err := cnt.HasInstallMount()
+			if tc.errMsg != "" {
+				assert.ErrorContains(t, err, tc.errMsg)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tc.expected, installMount)
+		})
+	}
+}
+
 func TestBootloaderHappy(t *testing.T) {
 	for _, tc := range []struct {
 		In  string

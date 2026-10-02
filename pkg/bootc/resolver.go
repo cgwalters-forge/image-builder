@@ -241,6 +241,12 @@ func (c *Container) ResolveInfo(variant string) (*Info, error) {
 	}
 	bootcInfo.UnifiedKernel = unifiedKernel
 
+	installMount, err := c.HasInstallMount()
+	if err != nil {
+		return nil, err
+	}
+	bootcInfo.InstallMount = installMount
+
 	size, err := getContainerSize(c.ref, c.storeOpts)
 	if err != nil {
 		return nil, err
@@ -254,10 +260,17 @@ func (c *Container) ResolveInfo(variant string) (*Info, error) {
 // used for build containers where we don't need all the information and trying
 // to get it might break things.
 func (c *Container) ResolveBuildInfo() (*Info, error) {
+	// The build container's bootc is the one that installs and mounts
+	// the deployment. Not all image types run bootc from the build
+	// container, so one without a working bootc is not an error here;
+	// the deployment is then mounted the way it was before "install
+	// mount".
+	installMount, _ := c.HasInstallMount()
 	return &Info{
-		Imgref:  c.ref,
-		ImageID: c.id,
-		Arch:    c.Arch(),
+		Imgref:       c.ref,
+		ImageID:      c.id,
+		Arch:         c.Arch(),
+		InstallMount: installMount,
 	}, nil
 }
 
@@ -412,6 +425,32 @@ func (c *Container) UnifiedKernel() (bool, error) {
 	}
 
 	return bootcInspect.Kernel.Unified, nil
+}
+
+// clapUsageExitCode is the exit code of bootc (from its clap argument
+// parser) for an unknown command.
+const clapUsageExitCode = 2
+
+// HasInstallMount finds out if the container's bootc has the "bootc install
+// mount" command (bootc-dev/bootc#2483). The command is probed for rather
+// than the bootc version, which doesn't tell for builds from git or
+// backports.
+func (c *Container) HasInstallMount() (bool, error) {
+	args := []string{"exec"}
+	args = append(args, c.storeOpts...)
+	args = append(args, c.id, "bootc", "install", "mount", "--help")
+
+	/* #nosec G204 */
+	if _, err := exec.Command("podman", args...).Output(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == clapUsageExitCode {
+				return false, nil
+			}
+			return false, fmt.Errorf("failed to run bootc install mount --help: %w, stderr:\n%s", err, exitErr.Stderr)
+		}
+		return false, fmt.Errorf("failed to run bootc install mount --help: %w", err)
+	}
+	return true, nil
 }
 
 func findImageIdFor(cntId, ref string, extraOpts []string) (string, error) {

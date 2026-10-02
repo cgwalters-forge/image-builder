@@ -315,6 +315,17 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 	}
 	img.PartitionTable = pt
 
+	var warnings []string
+	if bd.unifiedKernel {
+		warnings, err = t.checkUnifiedKernelCustomizations(customizations, options)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := t.checkUnifiedKernelRoot(pt, customizations); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	// Check Directory/File Customizations are valid
 	dc := customizations.GetDirectories()
 	fc := customizations.GetFiles()
@@ -368,7 +379,7 @@ func (t *bootcImageType) manifestForDisk(bp *blueprint.Blueprint, options distro
 		return nil, nil, err
 	}
 
-	return &mf, nil, nil
+	return &mf, warnings, nil
 }
 
 func (t *bootcImageType) initAnacondaInstallerBaseFromSourceInfo(img *image.AnacondaInstallerBase, sourceInfo *osinfo.Info, customizations *blueprint.Customizations) error {
@@ -834,6 +845,186 @@ func (t *bootcImageType) manifestForPXETar(bp *blueprint.Blueprint, options dist
 
 	return &mf, nil, nil
 
+}
+
+// unifiedKernelMountpoints are the mountpoints that work without an fstab on
+// images with a unified kernel: systemd-gpt-auto-generator discovers the root
+// and XBOOTLDR partitions and the ESP from their partition types (the ESP is
+// always at /boot/efi in our partition tables, bootc finds it on its own).
+var unifiedKernelMountpoints = []string{"/", "/boot", "/boot/efi"}
+
+func unsupportedUnifiedKernelMountpoints(mountpoints []string) []string {
+	return slices.DeleteFunc(mountpoints, func(mnt string) bool {
+		return slices.Contains(unifiedKernelMountpoints, mnt)
+	})
+}
+
+// diskCustomizationMountpoints returns all mountpoints of a disk
+// customization, including logical volumes and btrfs subvolumes.
+func diskCustomizationMountpoints(dc *blueprint.DiskCustomization) []string {
+	if dc == nil {
+		return nil
+	}
+	var mountpoints []string
+	for _, part := range dc.Partitions {
+		mountpoints = append(mountpoints, part.Mountpoint)
+		for _, lv := range part.LogicalVolumes {
+			mountpoints = append(mountpoints, lv.Mountpoint)
+		}
+		for _, subvol := range part.Subvolumes {
+			mountpoints = append(mountpoints, subvol.Mountpoint)
+		}
+	}
+	// swap and plain partitions without a filesystem have no mountpoint
+	return slices.DeleteFunc(mountpoints, func(mnt string) bool { return mnt == "" })
+}
+
+// checkUnifiedKernelCustomizations returns a warning for the customizations
+// that a disk image with a unified kernel (UKI) cannot apply. Its kernel
+// command line is embedded in the signed UKI and nothing is written into the
+// deployment after "bootc install", so these would otherwise be dropped
+// silently. Like other blueprint validation failures this is a warning, which
+// image-builder turns into an error unless --ignore-warnings is given.
+// TODO: support /etc and /var customizations, see
+// https://github.com/osbuild/image-builder/issues/2560
+func (t *bootcImageType) checkUnifiedKernelCustomizations(customizations *blueprint.Customizations, options distro.ImageOptions) ([]string, error) {
+	var unsupported []string
+	if len(customizations.GetUsers()) > 0 {
+		unsupported = append(unsupported, "customizations.user")
+	}
+	groups, err := customizations.GetGroups()
+	if err != nil {
+		return nil, err
+	}
+	if len(groups) > 0 {
+		unsupported = append(unsupported, "customizations.group")
+	}
+	if len(customizations.GetDirectories()) > 0 {
+		unsupported = append(unsupported, "customizations.directories")
+	}
+	if len(customizations.GetFiles()) > 0 {
+		unsupported = append(unsupported, "customizations.files")
+	}
+	if kernel := customizations.GetKernel(); kernel != nil && kernel.Append != "" {
+		unsupported = append(unsupported, "customizations.kernel.append")
+	}
+	ign, err := customizations.GetIgnition()
+	if err != nil {
+		return nil, err
+	}
+	if ign != nil {
+		unsupported = append(unsupported, "customizations.ignition")
+	}
+	if customizations.GetBootloader() != nil {
+		unsupported = append(unsupported, "customizations.bootloader")
+	}
+	if options.Subscription != nil {
+		unsupported = append(unsupported, "subscription")
+	}
+
+	// Filesystem and disk customizations are fine as long as their
+	// mountpoints are found without an fstab. The container's own disk.yaml
+	// is up to its author and not checked here.
+	var fsMountpoints []string
+	for _, fs := range customizations.GetFilesystems() {
+		fsMountpoints = append(fsMountpoints, fs.Mountpoint)
+	}
+	if mnts := unsupportedUnifiedKernelMountpoints(fsMountpoints); len(mnts) > 0 {
+		unsupported = append(unsupported, fmt.Sprintf("customizations.filesystem mountpoints without an fstab (%s)", strings.Join(mnts, ", ")))
+	}
+	diskCust, err := customizations.GetPartitioning()
+	if err != nil {
+		return nil, err
+	}
+	if mnts := unsupportedUnifiedKernelMountpoints(diskCustomizationMountpoints(diskCust)); len(mnts) > 0 {
+		unsupported = append(unsupported, fmt.Sprintf("customizations.disk mountpoints without an fstab (%s)", strings.Join(mnts, ", ")))
+	}
+
+	if len(unsupported) == 0 {
+		return nil, nil
+	}
+	return []string{fmt.Sprintf("blueprint validation failed for image type %q: the bootc container has a unified kernel (UKI), which does not support: %s", t.Name(), strings.Join(unsupported, ", "))}, nil
+}
+
+// checkUnifiedKernelRoot returns an error if the initrd of an image with a
+// unified kernel (UKI) can't find the root filesystem of pt. The UKI command
+// line normally has no root=, so systemd-gpt-auto-generator finds / by the
+// DPS root partition type, which only works for a filesystem directly on a
+// GPT partition of that type, or in a LUKS volume on it: not on LVM, and not
+// in a btrfs subvolume (gpt-auto mounts the default subvolume, and the UKI
+// has no rootflags=). A layout that comes from the container is up to its
+// author and not checked here.
+func (t *bootcImageType) checkUnifiedKernelRoot(pt *disk.PartitionTable, customizations *blueprint.Customizations) error {
+	bd := t.arch.distro.(*BootcDistro)
+	diskCust, err := customizations.GetPartitioning()
+	if err != nil {
+		return err
+	}
+	// the same precedence as in genPartitionTable()
+	if diskCust == nil && bd.sourceInfo != nil {
+		containerCust := bd.sourceInfo.ImageCustomization
+		containerDiskCust, err := containerCust.GetPartitioning()
+		if err != nil {
+			return err
+		}
+		containerHasLayout := containerCust.GetFilesystems() != nil || containerDiskCust != nil
+		if bd.sourceInfo.PartitionTable != nil || (customizations.GetFilesystems() == nil && containerHasLayout) {
+			return nil
+		}
+	}
+
+	const errPrefix = "bootc containers with a unified kernel (UKI) need / directly on a GPT partition with the root partition type: the UKI command line has no root=, so the initrd finds / by its partition type"
+	const useDiskCust = "use a plain partition for / in customizations.disk"
+	if pt.Type != disk.PT_GPT {
+		return fmt.Errorf("%s, but the partition table type is %q: use a gpt partition table", errPrefix, pt.Type)
+	}
+	// the path runs from the partition table via a partition to the root
+	// filesystem, with any volumes in between
+	var path []disk.Entity
+	err = pt.ForEachMountable(func(mnt disk.Mountable, p []disk.Entity) error {
+		if mnt.GetMountpoint() == "/" {
+			path = slices.Clone(p)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(path) < 3 {
+		return fmt.Errorf("%s, but the partition table has no root filesystem", errPrefix)
+	}
+	part, ok := path[1].(*disk.Partition)
+	if !ok {
+		return fmt.Errorf("%s, but / is not on a partition: %s", errPrefix, useDiskCust)
+	}
+	volumes := path[2 : len(path)-1]
+	// directly on the partition, or in a LUKS volume on it, is fine
+	if len(volumes) > 1 || (len(volumes) == 1 && !isLUKSContainer(volumes[0])) {
+		switch volumes[0].(type) {
+		case *disk.LVMVolumeGroup:
+			return fmt.Errorf("%s, but / is on an LVM logical volume: %s", errPrefix, useDiskCust)
+		case *disk.Btrfs:
+			if diskCust == nil {
+				return fmt.Errorf("%s, but the container's default root filesystem type %q puts / in a btrfs subvolume: use --bootc-default-fs (image-builder) or --rootfs (bootc-image-builder) with ext4 or xfs, or a plain partition for / in customizations.disk", errPrefix, bd.defaultFs)
+			}
+			return fmt.Errorf("%s, but / is in a btrfs subvolume: %s", errPrefix, useDiskCust)
+		default:
+			return fmt.Errorf("%s, but / is not directly on a partition: %s", errPrefix, useDiskCust)
+		}
+	}
+	rootType, err := disk.RootPartitionTypeGUID(t.arch.arch)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(part.Type, rootType) {
+		return fmt.Errorf("%s, but the partition of / has the type %s instead of %s: leave part_type unset for / in customizations.disk", errPrefix, part.Type, rootType)
+	}
+	return nil
+}
+
+func isLUKSContainer(ent disk.Entity) bool {
+	_, ok := ent.(*disk.LUKSContainer)
+	return ok
 }
 
 func PlatformFor(archStr, uefiVendor string) *platform.Data {
